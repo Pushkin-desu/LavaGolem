@@ -1,0 +1,25 @@
+# LavaGolem configuration
+
+# Search radius for chests and cauldrons (in blocks)
+search-radius: 8
+
+# Distance at which the golem considers it has reached its target
+reach-distance: 2.2
+
+# Search cooldown in ticks when nothing is found (20 ticks = 1 second)
+search-cooldown-ticks: 40
+
+# Golem logic tick period (10 = every 0.5 seconds)
+tick-period: 10
+
+# Text on signs that the golem looks for on bucket chests (any of 6 faces)
+bucket-sign-text: "[Buckets]"
+
+# Text on signs that the golem looks for on lava deposit chests
+lava-sign-text: "[Lava]"
+
+# Message locale: en, ru
+locale: en
+
+# Enable anonymous usage statistics via bStats (https://bstats.org/)
+bstats: true
