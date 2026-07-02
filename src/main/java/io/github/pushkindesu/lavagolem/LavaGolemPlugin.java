@@ -10,11 +10,15 @@ import org.bukkit.World;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Mob;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.FurnaceRecipe;
+import org.bukkit.inventory.Recipe;
 import org.bukkit.inventory.ShapedRecipe;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -25,16 +29,33 @@ public final class LavaGolemPlugin extends JavaPlugin {
 
     // PDC keys
     public NamespacedKey heartItemKey;
+    public NamespacedKey heartRoleKey;
     public NamespacedKey golemEntityKey;
+    public NamespacedKey roleKey;
+    public NamespacedKey modeKey;
     public NamespacedKey lavaDeliveredKey;
     public NamespacedKey bucketsTakenKey;
+    public NamespacedKey itemsSmeltedKey;
     public NamespacedKey createdAtKey;
+
+    /** Golem roles. */
+    public static final String ROLE_HAULER = "LAVA_HAULER";
+    public static final String ROLE_SMELTER = "SMELTER";
+
+    /** Smelter work modes (configurable per-golem via its GUI). */
+    public static final String MODE_BALANCED = "BALANCED";
+    public static final String MODE_LOAD_ONLY = "LOAD_ONLY";
+    public static final String MODE_COLLECT_ONLY = "COLLECT_ONLY";
 
     /** UUIDs of golems whose vanilla AI has already been cleaned up in this session. */
     public final Set<UUID> cleanedUpGolems = ConcurrentHashMap.newKeySet();
 
+    /** Materials that are valid inputs for a regular furnace, discovered from recipes at startup. */
+    public final Set<Material> smeltableInputs = new HashSet<>();
+
     public PluginConfig cfg;
     public Messages msg;
+    public GolemMenu golemMenu;
 
     @Override
     public void onEnable() {
@@ -42,17 +63,25 @@ public final class LavaGolemPlugin extends JavaPlugin {
         msg = new Messages(this);
 
         heartItemKey     = new NamespacedKey(this, "golem_heart");
+        heartRoleKey     = new NamespacedKey(this, "heart_role");
         golemEntityKey   = new NamespacedKey(this, "lava_golem");
+        roleKey          = new NamespacedKey(this, "role");
+        modeKey          = new NamespacedKey(this, "mode");
         lavaDeliveredKey = new NamespacedKey(this, "lava_delivered");
         bucketsTakenKey  = new NamespacedKey(this, "buckets_taken");
+        itemsSmeltedKey  = new NamespacedKey(this, "items_smelted");
         createdAtKey     = new NamespacedKey(this, "created_at");
 
         if (cfg.bstats) {
             new org.bstats.bukkit.Metrics(this, 31068);
         }
 
+        buildSmeltableInputs();
         registerHeartRecipe();
+        registerSmelterHeartRecipe();
+        golemMenu = new GolemMenu(this);
         getServer().getPluginManager().registerEvents(new HeartUseListener(this), this);
+        getServer().getPluginManager().registerEvents(golemMenu, this);
 
         getCommand("removegolems").setExecutor((sender, command, label, args) -> {
             int count = 0;
@@ -73,6 +102,7 @@ public final class LavaGolemPlugin extends JavaPlugin {
             int golems = 0;
             int totalLava = 0;
             int totalBuckets = 0;
+            int totalSmelted = 0;
             for (World world : Bukkit.getWorlds()) {
                 for (Entity entity : world.getEntitiesByClass(Mob.class)) {
                     if (!entity.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
@@ -81,6 +111,8 @@ public final class LavaGolemPlugin extends JavaPlugin {
                             .getOrDefault(lavaDeliveredKey, PersistentDataType.INTEGER, 0);
                     totalBuckets += entity.getPersistentDataContainer()
                             .getOrDefault(bucketsTakenKey, PersistentDataType.INTEGER, 0);
+                    totalSmelted += entity.getPersistentDataContainer()
+                            .getOrDefault(itemsSmeltedKey, PersistentDataType.INTEGER, 0);
                 }
             }
             sender.sendMessage(Component.text()
@@ -94,6 +126,9 @@ public final class LavaGolemPlugin extends JavaPlugin {
                     .append(Component.newline())
                     .append(Component.text(msg.get("total-buckets"), NamedTextColor.GRAY))
                     .append(Component.text(totalBuckets, NamedTextColor.WHITE))
+                    .append(Component.newline())
+                    .append(Component.text(msg.get("total-smelted"), NamedTextColor.GRAY))
+                    .append(Component.text(totalSmelted, NamedTextColor.WHITE))
                     .build());
             return true;
         });
@@ -106,6 +141,18 @@ public final class LavaGolemPlugin extends JavaPlugin {
     @Override
     public void onDisable() {
         Bukkit.removeRecipe(new NamespacedKey(this, "golem_heart_recipe"));
+        Bukkit.removeRecipe(new NamespacedKey(this, "smelter_heart_recipe"));
+    }
+
+    /** Builds the set of materials that are valid inputs for a regular furnace. */
+    private void buildSmeltableInputs() {
+        Iterator<Recipe> it = Bukkit.recipeIterator();
+        while (it.hasNext()) {
+            Recipe recipe = it.next();
+            if (recipe instanceof FurnaceRecipe furnaceRecipe) {
+                smeltableInputs.add(furnaceRecipe.getInput().getType());
+            }
+        }
     }
 
     /**
@@ -158,19 +205,36 @@ public final class LavaGolemPlugin extends JavaPlugin {
         }
     }
 
-    /** Creates the Golem Heart item (copper golem spawn egg with PDC tag). */
+    /** Creates the Golem Heart item for the default (LAVA_HAULER) role. */
     public ItemStack createGolemHeart() {
+        return createGolemHeart(ROLE_HAULER);
+    }
+
+    /** Creates the Golem Heart item (copper golem spawn egg with PDC tag) for the given role. */
+    public ItemStack createGolemHeart(String role) {
         ItemStack item = new ItemStack(Material.COPPER_GOLEM_SPAWN_EGG);
         ItemMeta meta = item.getItemMeta();
-        meta.displayName(Component.text(msg.get("heart-display-name"), NamedTextColor.GOLD)
-                .decoration(TextDecoration.ITALIC, false));
-        meta.lore(List.of(
-                Component.text(msg.get("heart-lore-1"), NamedTextColor.GRAY)
-                        .decoration(TextDecoration.ITALIC, false),
-                Component.text(msg.get("heart-lore-2"), NamedTextColor.GRAY)
-                        .decoration(TextDecoration.ITALIC, false)
-        ));
+        if (ROLE_SMELTER.equals(role)) {
+            meta.displayName(Component.text(msg.get("smelter-heart-display-name"), NamedTextColor.GOLD)
+                    .decoration(TextDecoration.ITALIC, false));
+            meta.lore(List.of(
+                    Component.text(msg.get("smelter-heart-lore-1"), NamedTextColor.GRAY)
+                            .decoration(TextDecoration.ITALIC, false),
+                    Component.text(msg.get("smelter-heart-lore-2"), NamedTextColor.GRAY)
+                            .decoration(TextDecoration.ITALIC, false)
+            ));
+        } else {
+            meta.displayName(Component.text(msg.get("heart-display-name"), NamedTextColor.GOLD)
+                    .decoration(TextDecoration.ITALIC, false));
+            meta.lore(List.of(
+                    Component.text(msg.get("heart-lore-1"), NamedTextColor.GRAY)
+                            .decoration(TextDecoration.ITALIC, false),
+                    Component.text(msg.get("heart-lore-2"), NamedTextColor.GRAY)
+                            .decoration(TextDecoration.ITALIC, false)
+            ));
+        }
         meta.getPersistentDataContainer().set(heartItemKey, PersistentDataType.BYTE, (byte) 1);
+        meta.getPersistentDataContainer().set(heartRoleKey, PersistentDataType.STRING, role);
         item.setItemMeta(meta);
         return item;
     }
@@ -178,13 +242,26 @@ public final class LavaGolemPlugin extends JavaPlugin {
     private void registerHeartRecipe() {
         ShapedRecipe recipe = new ShapedRecipe(
                 new NamespacedKey(this, "golem_heart_recipe"),
-                createGolemHeart()
+                createGolemHeart(ROLE_HAULER)
         );
         // Pattern: CRC / RLR / CRC (copper corners, redstone cross, lava bucket center)
         recipe.shape("CRC", "RLR", "CRC");
         recipe.setIngredient('C', Material.COPPER_INGOT);
         recipe.setIngredient('R', Material.REDSTONE);
         recipe.setIngredient('L', Material.LAVA_BUCKET);
+        Bukkit.addRecipe(recipe);
+    }
+
+    private void registerSmelterHeartRecipe() {
+        ShapedRecipe recipe = new ShapedRecipe(
+                new NamespacedKey(this, "smelter_heart_recipe"),
+                createGolemHeart(ROLE_SMELTER)
+        );
+        // Pattern: CRC / RLR / CRC (copper corners, redstone cross, furnace center)
+        recipe.shape("CRC", "RLR", "CRC");
+        recipe.setIngredient('C', Material.COPPER_INGOT);
+        recipe.setIngredient('R', Material.REDSTONE);
+        recipe.setIngredient('L', Material.FURNACE);
         Bukkit.addRecipe(recipe);
     }
 }

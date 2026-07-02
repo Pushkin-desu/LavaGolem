@@ -8,6 +8,9 @@ public class PluginConfig {
     public final long tickPeriod;
     public final String bucketSignText;
     public final String lavaSignText;
+    public final String smeltSignText;
+    public final String fuelSignText;
+    public final String outputSignText;
     public final String locale;
     public final boolean bstats;
 
@@ -20,6 +23,9 @@ public class PluginConfig {
         this.tickPeriod          = c.getLong("tick-period", 10);
         this.bucketSignText      = c.getString("bucket-sign-text", "[Buckets]");
         this.lavaSignText        = c.getString("lava-sign-text", "[Lava]");
+        this.smeltSignText       = c.getString("smelt-sign-text", "[Smelt]");
+        this.fuelSignText        = c.getString("fuel-sign-text", "[Fuel]");
+        this.outputSignText      = c.getString("output-sign-text", "[Output]");
         this.locale              = c.getString("locale", "en");
         this.bstats              = c.getBoolean("bstats", true);
     }
