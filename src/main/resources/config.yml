@@ -12,11 +12,25 @@ search-cooldown-ticks: 40
 # Golem logic tick period (10 = every 0.5 seconds)
 tick-period: 10
 
-# Text on signs that the golem looks for on bucket chests (any of 6 faces)
+# How to tag a storage container (chest, trapped chest, barrel or shulker box):
+#   - place a sign with the matching text on any of its 6 faces, OR
+#   - rename the container itself to the matching text in an anvil (no sign needed).
+# The texts below are what the golems look for.
+
+# Bucket source containers (Lava Golem)
 bucket-sign-text: "[Buckets]"
 
-# Text on signs that the golem looks for on lava deposit chests
+# Lava deposit containers (Lava Golem)
 lava-sign-text: "[Lava]"
+
+# Containers holding items to smelt (Smelter golem)
+smelt-sign-text: "[Smelt]"
+
+# Containers holding fuel for furnaces (Smelter golem)
+fuel-sign-text: "[Fuel]"
+
+# Containers where smelted output (and spent buckets) are delivered (Smelter golem)
+output-sign-text: "[Output]"
 
 # Message locale: en, ru
 locale: en
