@@ -32,6 +32,23 @@ fuel-sign-text: "[Fuel]"
 # Containers where smelted output (and spent buckets) are delivered (Smelter golem)
 output-sign-text: "[Output]"
 
+# --- Courier golem ---
+# The courier carries items between tagged containers along routes you set in its GUI.
+# Search radius is the SAME in every direction (up/down included) and must cover both ends of a
+# route. It scans a cube, so cost grows as radius^3 — keep it just big enough (max 32).
+courier-search-radius: 24
+# Max items a courier carries per trip (1-64).
+courier-carry-limit: 16
+# Waypoint marker text. Place signs with this text along a walkable path and the courier will
+# walk marker-to-marker when it can't reach a target directly (e.g. up stairs) instead of teleporting.
+waypoint-sign-text: "[Waypoint]"
+# If the courier can't path to its target (long distance / rough terrain), let it teleport
+# toward the target when stuck. Set false for pure walking (routes must be short & walkable).
+courier-teleport: true
+# Logic ticks of no path progress before the courier teleports toward its target
+# (a logic tick is `tick-period` game ticks; at the default that's ~0.5s, so 20 = ~10s).
+courier-stuck-ticks: 20
+
 # Message locale: en, ru
 locale: en
 

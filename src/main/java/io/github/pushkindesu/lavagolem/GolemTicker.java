@@ -37,7 +37,24 @@ public class GolemTicker extends BukkitRunnable {
     private final NamespacedKey jobFurnaceKey;
     private final NamespacedKey jobAmountKey;
     private final NamespacedKey jobMaterialKey;
+    private final NamespacedKey courierActiveKey;
+    private final NamespacedKey courierDestKey;
+    private final NamespacedKey courierRrKey;
+    private final NamespacedKey courierFinalKey;
     private int tickCount = 0;
+
+    /** Transient per-golem "stuck" progress tracking for the courier's teleport fallback. */
+    private final Map<java.util.UUID, double[]> courierStuck = new HashMap<>(); // uuid -> {stallTicks, lastDist}
+
+    /** Short-lived cache of nearby storage containers per courier, so the expensive radius cube
+     *  scan runs at most every ~10s (per stationary golem) instead of on every decision. */
+    private final Map<java.util.UUID, ContainerCache> courierContainerCache = new HashMap<>();
+    private static final class ContainerCache {
+        long expiry; int cx, cz; List<Block> list; List<Location> waypoints;
+    }
+
+    /** Transient per-courier navigation state: which waypoints it has already passed this leg. */
+    private final Map<java.util.UUID, java.util.Set<Long>> courierVisited = new HashMap<>();
 
     /** Fuel capacity in "furnace item slots" per fuel unit (burn_ticks / 200), hardcoded per spec. */
     private static final Map<Material, Integer> FUEL_CAPACITY = new HashMap<>();
@@ -58,6 +75,10 @@ public class GolemTicker extends BukkitRunnable {
         this.jobFurnaceKey     = new NamespacedKey(plugin, "job_furnace");
         this.jobAmountKey      = new NamespacedKey(plugin, "job_amount");
         this.jobMaterialKey    = new NamespacedKey(plugin, "job_material");
+        this.courierActiveKey  = new NamespacedKey(plugin, "courier_active");
+        this.courierDestKey    = new NamespacedKey(plugin, "courier_dest");
+        this.courierRrKey      = new NamespacedKey(plugin, "courier_rr");
+        this.courierFinalKey   = new NamespacedKey(plugin, "courier_final");
     }
 
     @Override
@@ -80,12 +101,19 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void tickGolem(Mob golem) {
+        // Hold a golem still, whatever its role, while a player has its menu open — so it doesn't
+        // walk away, and a courier never starts on a half-configured route (movement is halted
+        // once, on open, in markMenuOpen). It resumes on the next tick after the menu closes.
+        if (plugin.isMenuOpen(golem.getUniqueId())) return;
+
         PersistentDataContainer pdc = golem.getPersistentDataContainer();
         String role = pdc.getOrDefault(plugin.roleKey, PersistentDataType.STRING,
                 LavaGolemPlugin.ROLE_HAULER);
 
         if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) {
             tickSmelter(golem, pdc);
+        } else if (LavaGolemPlugin.ROLE_COURIER.equals(role)) {
+            tickCourier(golem, pdc);
         } else {
             tickHauler(golem, pdc);
         }
@@ -200,37 +228,53 @@ public class GolemTicker extends BukkitRunnable {
 
         // 2) INPUT — furnace with empty input slot, [Smelt] has a smeltable material
         if (canLoad && smeltChest != null && smeltChest.getState() instanceof Container smeltChestState) {
-            Material bestMaterial = null;
-            int bestCount = 0;
             Inventory smeltInv = smeltChestState.getInventory();
             Map<Material, Integer> counts = new HashMap<>();
             for (ItemStack stack : smeltInv.getContents()) {
                 if (stack == null || stack.getType() == Material.AIR) continue;
-                if (!plugin.smeltableInputs.contains(stack.getType())) continue;
-                counts.merge(stack.getType(), stack.getAmount(), Integer::sum);
-            }
-            for (var e : counts.entrySet()) {
-                if (e.getValue() > bestCount) { bestCount = e.getValue(); bestMaterial = e.getKey(); }
+                Material mt = stack.getType();
+                if (!plugin.smeltableInputs.contains(mt)
+                        && !plugin.blastableInputs.contains(mt)
+                        && !plugin.smokableInputs.contains(mt)) continue;
+                counts.merge(mt, stack.getAmount(), Integer::sum);
             }
 
-            if (bestMaterial != null) {
+            if (!counts.isEmpty()) {
+                // Pick the nearest idle furnace that can smelt something we have, together with
+                // that furnace's most-abundant acceptable material. furnaceAccepts routes ores to
+                // blast furnaces and food to smokers (and keeps e.g. sand out of a smoker).
                 Block bestFurnace = null;
+                Material bestMaterial = null;
                 double bestDist = Double.MAX_VALUE;
-                int emptyCount = 0;
                 for (Block f : furnaces) {
                     if (!(f.getState() instanceof Furnace furnace)) continue;
                     ItemStack smelting = furnace.getInventory().getSmelting();
                     if (smelting != null && smelting.getType() != Material.AIR) continue;
-                    emptyCount++;
+                    Material m = null;
+                    int mc = 0;
+                    for (var e : counts.entrySet()) {
+                        if (e.getValue() > mc && furnaceAccepts(f.getType(), e.getKey())) {
+                            mc = e.getValue();
+                            m = e.getKey();
+                        }
+                    }
+                    if (m == null) continue;
                     double d = f.getLocation().distanceSquared(origin);
-                    if (d < bestDist) { bestDist = d; bestFurnace = f; }
+                    if (d < bestDist) { bestDist = d; bestFurnace = f; bestMaterial = m; }
                 }
 
                 if (bestFurnace != null && bestFurnace.getState() instanceof Furnace furnace) {
-                    int a = bestCount;
-                    // Spread the pile evenly across all idle furnaces so they all run in parallel
-                    // (for big piles this share is capped at a full stack, i.e. 64 each).
-                    int share = Math.max(1, (int) Math.ceil(a / (double) emptyCount));
+                    int a = counts.get(bestMaterial);
+                    // Spread evenly across all idle furnaces that ALSO accept this material, so
+                    // they run in parallel (for big piles this share is capped at 64 each).
+                    int emptyCount = 0;
+                    for (Block f : furnaces) {
+                        if (!(f.getState() instanceof Furnace ff)) continue;
+                        ItemStack sm = ff.getInventory().getSmelting();
+                        if (sm != null && sm.getType() != Material.AIR) continue;
+                        if (furnaceAccepts(f.getType(), bestMaterial)) emptyCount++;
+                    }
+                    int share = Math.max(1, (int) Math.ceil(a / (double) Math.max(1, emptyCount)));
                     ItemStack existingFuel = furnace.getInventory().getFuel();
                     int n;
                     if (existingFuel != null && existingFuel.getType() != Material.AIR
@@ -315,14 +359,23 @@ public class GolemTicker extends BukkitRunnable {
     /** Nearest furnace with a result to collect; if {@code onlyFull}, only fully-stacked (stalled) ones. */
     private Block selectCollectFurnace(List<Block> furnaces, Location origin, boolean onlyFull) {
         Block best = null;
+        int bestAmount = -1;
         double bestDist = Double.MAX_VALUE;
         for (Block f : furnaces) {
             if (!(f.getState() instanceof Furnace furnace)) continue;
             ItemStack result = furnace.getInventory().getResult();
             if (result == null || result.getType() == Material.AIR) continue;
             if (onlyFull && result.getAmount() < result.getMaxStackSize()) continue;
+            int amt = result.getAmount();
             double d = f.getLocation().distanceSquared(origin);
-            if (d < bestDist) { bestDist = d; best = f; }
+            // Prefer the LARGEST backlog, tie-break nearest. Picking nearest alone lets a cluster
+            // of fast, close furnaces starve a farther one (e.g. a lone smoker) forever; the
+            // neglected furnace's backlog grows until it wins, keeping collection fair.
+            if (amt > bestAmount || (amt == bestAmount && d < bestDist)) {
+                bestAmount = amt;
+                bestDist = d;
+                best = f;
+            }
         }
         return best;
     }
@@ -452,7 +505,7 @@ public class GolemTicker extends BukkitRunnable {
             for (int dy = -4; dy <= 4; dy++) {
                 for (int dz = -r; dz <= r; dz++) {
                     Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
-                    if (b.getType() != Material.FURNACE) continue;
+                    if (!isFurnaceMaterial(b.getType())) continue;
                     if (excludeLoc != null && b.getLocation().equals(excludeLoc)) continue;
                     if (!(b.getState() instanceof Furnace furnace)) continue;
                     ItemStack result = furnace.getInventory().getResult();
@@ -563,7 +616,7 @@ public class GolemTicker extends BukkitRunnable {
             for (int dy = -4; dy <= 4; dy++) {
                 for (int dz = -r; dz <= r; dz++) {
                     Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
-                    if (b.getType() != Material.FURNACE) continue;
+                    if (!isFurnaceMaterial(b.getType())) continue;
                     if (excludeLoc != null && b.getLocation().equals(excludeLoc)) continue;
                     if (!(b.getState() instanceof Furnace furnace)) continue;
                     ItemStack fuel = furnace.getInventory().getFuel();
@@ -707,7 +760,9 @@ public class GolemTicker extends BukkitRunnable {
         int amount = getJobAmount(golem);
         Material material = getJobMaterial(golem);
         ItemStack taken = gatherFromContainer(chest, material, amount,
-                m -> plugin.smeltableInputs.contains(m));
+                m -> plugin.smeltableInputs.contains(m)
+                        || plugin.blastableInputs.contains(m)
+                        || plugin.smokableInputs.contains(m));
         if (taken == null) {
             // Nothing usable found anymore — retry later
             clearJobFurnace(golem);
@@ -775,6 +830,516 @@ public class GolemTicker extends BukkitRunnable {
         }
     }
 
+    // ===== COURIER =====
+
+    private void tickCourier(Mob golem, PersistentDataContainer pdc) {
+        ensureCourierNav(golem);
+        String state = pdc.getOrDefault(stateKey, PersistentDataType.STRING, "COURIER_IDLE");
+        switch (state) {
+            case "COURIER_IDLE"      -> courierDecide(golem);
+            case "COURIER_TO_SOURCE" -> moveToTargetCourier(golem, this::onReachCourierSource);
+            case "COURIER_TO_DEST"   -> moveToTargetCourier(golem, this::onReachCourierDest);
+            default -> setCourierState(golem, "COURIER_IDLE");
+        }
+    }
+
+    private void courierDecide(Mob golem) {
+        if (!canSearch(golem)) return;
+        Location origin = golem.getLocation();
+
+        // Safety net: deliver a carried item before starting a new pickup (same rule as the smelter).
+        ItemStack held = golem.getEquipment().getItemInMainHand();
+        if (held != null && held.getType() != Material.AIR) {
+            Location dest = getCourierDest(golem);
+            if (dest != null) {
+                clearSearchCooldown(golem);
+                startCourierMove(golem, dest);
+                setCourierState(golem, "COURIER_TO_DEST");
+            } else {
+                delayNextSearch(golem); // nowhere recorded to put it — hold
+            }
+            return;
+        }
+
+        List<CourierRoute> routes = getCourierRoutes(golem);
+        if (routes.isEmpty()) { delayNextSearch(golem); return; }
+
+        int r = plugin.cfg.courierSearchRadius;
+        int start = golem.getPersistentDataContainer().getOrDefault(courierRrKey, PersistentDataType.INTEGER, 0);
+        // Scan the (large) cube ONCE (cached ~10s), then evaluate every route against the containers.
+        List<Block> containers = courierScan(golem, origin, r).list;
+        if (containers.isEmpty()) { delayNextSearch(golem); return; }
+        // Round-robin over routes so no single route starves the others.
+        for (int k = 0; k < routes.size(); k++) {
+            int idx = ((start + k) % routes.size() + routes.size()) % routes.size();
+            CourierRoute route = routes.get(idx);
+            if (!route.isConfigured()) continue;
+            Block source = nearestSource(origin, containers, route);
+            if (source == null) continue;
+            Block dest = nearestDest(origin, containers, route.dest);
+            if (dest == null) continue;
+            if (source.getLocation().equals(dest.getLocation())) continue;
+
+            clearSearchCooldown(golem);
+            golem.getPersistentDataContainer().set(courierActiveKey, PersistentDataType.INTEGER, idx);
+            golem.getPersistentDataContainer().set(courierRrKey, PersistentDataType.INTEGER, (idx + 1) % routes.size());
+            setCourierDest(golem, dest.getLocation());
+            startCourierMove(golem, source.getLocation());
+            setCourierState(golem, "COURIER_TO_SOURCE");
+            return;
+        }
+        delayNextSearch(golem);
+    }
+
+    private void onReachCourierSource(Mob golem, Block block) {
+        CourierRoute route = activeCourierRoute(golem);
+        Location dest = getCourierDest(golem);
+        if (route == null || dest == null || !(block.getState() instanceof Container chest)) {
+            abortCourier(golem);
+            return;
+        }
+        ItemStack taken = gatherFromContainer(chest, null, plugin.cfg.courierCarryLimit, route::carries);
+        if (taken == null) { abortCourier(golem); return; }
+        golem.getEquipment().setItemInMainHand(taken);
+        startCourierMove(golem, dest);
+        setCourierState(golem, "COURIER_TO_DEST");
+    }
+
+    private void onReachCourierDest(Mob golem, Block block) {
+        ItemStack hand = golem.getEquipment().getItemInMainHand();
+        if (hand == null || hand.getType() == Material.AIR) { abortCourier(golem); return; }
+
+        if (!(block.getState() instanceof Container chest)) {
+            // Destination gone — re-find by the active route's dest tag; else hold (IDLE net retries).
+            CourierRoute route = activeCourierRoute(golem);
+            Block redo = (route != null)
+                    ? findCourierDest(golem.getLocation(), route.dest, plugin.cfg.courierSearchRadius) : null;
+            if (redo != null) {
+                setCourierDest(golem, redo.getLocation());
+                startCourierMove(golem, redo.getLocation());
+                setCourierState(golem, "COURIER_TO_DEST");
+            } else {
+                setCourierState(golem, "COURIER_IDLE");
+            }
+            return;
+        }
+
+        CourierRoute route = activeCourierRoute(golem);
+
+        var leftover = chest.getInventory().addItem(hand.clone());
+        if (!leftover.isEmpty()) {
+            // Destination is full. Don't block the courier forever — try another container with
+            // the same dest tag; if none, return the load to a source-tagged container so the hand
+            // frees up and other routes can run (this full route is skipped at decide time anyway).
+            if (route == null) {
+                // Route was deleted mid-carry: stop retrying; idle and let the safety net re-home.
+                clearCourierJob(golem);
+                setCourierState(golem, "COURIER_IDLE");
+                return;
+            }
+            int r = plugin.cfg.courierSearchRadius;
+            Block alt = findCourierDest(golem.getLocation(), route.dest, r);
+            if (alt != null && !alt.getLocation().equals(block.getLocation())) {
+                setCourierDest(golem, alt.getLocation());
+                startCourierMove(golem, alt.getLocation());
+                return;
+            }
+            Block back = findCourierDest(golem.getLocation(), route.source, r);
+            if (back != null) {
+                setCourierDest(golem, back.getLocation());
+                startCourierMove(golem, back.getLocation());
+                return;
+            }
+            startCourierMove(golem, block.getLocation()); // nowhere to offload — hold and retry
+            return;
+        }
+        // Only count real deliveries to a dest-tagged container (not loads returned to a source).
+        if (route != null && containerHasTag(block, route.dest)) {
+            int moved = golem.getPersistentDataContainer().getOrDefault(plugin.itemsMovedKey, PersistentDataType.INTEGER, 0);
+            golem.getPersistentDataContainer().set(plugin.itemsMovedKey, PersistentDataType.INTEGER, moved + hand.getAmount());
+        }
+        golem.getEquipment().setItemInMainHand(new ItemStack(Material.AIR));
+        clearCourierJob(golem);
+        setCourierState(golem, "COURIER_IDLE");
+    }
+
+    /** Raise a courier's follow (pathfinding) range so it can walk longer routes around corners
+     *  and up stairs on its own legs. Applied every tick so existing golems get it without a reload. */
+    private void ensureCourierNav(Mob golem) {
+        try {
+            org.bukkit.attribute.AttributeInstance attr =
+                    golem.getAttribute(org.bukkit.attribute.Attribute.FOLLOW_RANGE);
+            if (attr != null) {
+                // Follow range caps how long a path the navigation will build; raise it toward the
+                // search radius (capped at 96) so it can actually walk a long route end to end.
+                double want = Math.min(plugin.cfg.courierSearchRadius + 8, 96);
+                if (attr.getBaseValue() < want) attr.setBaseValue(want);
+            }
+        } catch (Throwable ignored) { /* attribute unavailable on this version */ }
+    }
+
+    // ===== COURIER MOVEMENT (with teleport fallback) =====
+
+    /** Begins a movement leg toward {@code finalLoc} (a container), routing via waypoints if needed. */
+    private void startCourierMove(Mob golem, Location finalLoc) {
+        setCourierFinal(golem, finalLoc);
+        courierVisited.remove(golem.getUniqueId());
+        courierStuck.remove(golem.getUniqueId());
+        setTarget(golem, courierHop(golem, finalLoc));
+    }
+
+    private void moveToTargetCourier(Mob golem, ReachCallback onReach) {
+        Location hop = getTarget(golem);
+        Location fin = getCourierFinal(golem);
+        if (fin == null) fin = hop;
+        if (hop == null || fin == null) {
+            courierStuck.remove(golem.getUniqueId());
+            courierVisited.remove(golem.getUniqueId());
+            setCourierState(golem, "COURIER_IDLE");
+            return;
+        }
+
+        // Arrived at the final container? Measure to the block's CENTER, not its corner: a container
+        // is a solid block the golem can't stand on, and when another container blocks the near face
+        // the golem stops one cell back. Corner-distance then reads ~0.5 over the real gap and the
+        // golem would stall and teleport while physically already next to the target.
+        if (reachDist(golem.getLocation(), fin) <= plugin.cfg.reachDistance) {
+            courierStuck.remove(golem.getUniqueId());
+            courierVisited.remove(golem.getUniqueId());
+            Block block = fin.getBlock();
+            clearTarget(golem);
+            onReach.onReach(golem, block);
+            return;
+        }
+
+        // Reached the current waypoint hop → mark it passed and pick the next hop toward the final.
+        if (reachDist(golem.getLocation(), hop) <= plugin.cfg.reachDistance) {
+            markVisited(golem, hop);
+            courierStuck.remove(golem.getUniqueId());
+            setTarget(golem, courierHop(golem, fin));
+            return;
+        }
+
+        // Walk to the current hop. Teleport (to the final) ONLY after genuinely making no headway
+        // toward the hop for the full stuck window — never as a quick reaction to moveTo() briefly
+        // returning false, which made it blink ~10 blocks early even on a clear straight line (the
+        // target is the container's solid block, so pathing to it reports "false" intermittently).
+        // It now walks the whole way and blinks only when truly stuck. st = {stallTicks, lastDist}.
+        double[] st = courierStuck.computeIfAbsent(golem.getUniqueId(), u -> new double[]{0, Double.MAX_VALUE});
+        double d = golem.getLocation().distance(hop);
+        if (d < st[1] - 0.25) {        // got at least a quarter-block closer → still making progress
+            st[0] = 0;
+            st[1] = d;
+        } else {
+            st[0] += 1;                // no measurable progress this tick
+        }
+        if (plugin.cfg.courierTeleport && st[0] >= plugin.cfg.courierStuckTicks) {
+            golem.teleport(safeSpotNear(fin));
+            courierVisited.remove(golem.getUniqueId());
+            setTarget(golem, fin);
+            st[0] = 0;
+            st[1] = Double.MAX_VALUE;
+        } else {
+            golem.getPathfinder().moveTo(hop, 1.0);
+        }
+    }
+
+    /** Next hop toward {@code finalLoc}: the final itself if directly walkable, else the waypoint
+     *  CLOSEST TO THE FINAL among those this golem can actually path to and hasn't passed yet.
+     *  Waypoints are shared, anonymous road signs: every golem evaluates them against its own goal,
+     *  so one network of markers serves any number of couriers and routes with no configuration. */
+    private Location courierHop(Mob golem, Location finalLoc) {
+        if (pathReaches(golem, finalLoc)) return finalLoc;
+        List<Location> wps = courierScan(golem, golem.getLocation(), plugin.cfg.courierSearchRadius).waypoints;
+        java.util.Set<Long> visited = courierVisited.get(golem.getUniqueId());
+        List<Location> candidates = new ArrayList<>();
+        for (Location w : wps) {
+            if (visited != null && visited.contains(keyOf(w))) continue;
+            candidates.add(w);
+        }
+        candidates.sort(java.util.Comparator.comparingDouble(w -> w.distanceSquared(finalLoc)));
+        // Best-first: take the closest-to-goal marker we can reach. Each miss costs one pathfind,
+        // so bound the tries; a hop is only picked on arrival, not every tick.
+        int tries = Math.min(candidates.size(), HOP_CANDIDATE_LIMIT);
+        for (int i = 0; i < tries; i++) {
+            Location w = candidates.get(i);
+            if (pathReaches(golem, w)) return w;
+        }
+        // No direct path and no usable marker: rather than beeline at an unreachable far block (which
+        // just stalls and teleports), walk to the farthest point ALONG THE WAY we can actually path to.
+        // This makes long walkable stretches (e.g. a straight corridor past the last stair marker) get
+        // covered on foot without a marker on every span. Teleport only if even this finds nothing.
+        Location stone = steppingStoneToward(golem, finalLoc);
+        return stone != null ? stone : finalLoc;
+    }
+
+    private static final int HOP_CANDIDATE_LIMIT = 8;
+
+    /** The farthest standable point on the straight line toward {@code target} that the mob can
+     *  actually path to right now, or null if it can't even advance a few blocks that way. */
+    private Location steppingStoneToward(Mob golem, Location target) {
+        Location from = golem.getLocation();
+        org.bukkit.util.Vector dir = target.toVector().subtract(from.toVector());
+        double dist = dir.length();
+        if (dist < 3) return null;
+        dir.multiply(1.0 / dist); // unit vector toward the target
+        double max = Math.min(dist - 1, plugin.cfg.courierSearchRadius);
+        // Probe far → near so the first reachable point is the biggest safe stride.
+        for (double step = max; step >= 3; step -= 3) {
+            Location probe = from.clone().add(dir.getX() * step, dir.getY() * step, dir.getZ() * step);
+            Location spot = safeSpotNear(probe);
+            if (spot != null && pathReaches(golem, spot)) return spot;
+        }
+        return null;
+    }
+
+    /** Whether the mob's navigation can build a path whose end actually reaches {@code loc}. */
+    private boolean pathReaches(Mob golem, Location loc) {
+        var pf = golem.getPathfinder();
+        if (!pf.moveTo(loc, 1.0)) return false;
+        var path = pf.getCurrentPath();
+        if (path == null) return false;
+        Location fp = path.getFinalPoint();
+        return fp != null && fp.distanceSquared(loc) <= 6.25; // within ~2.5 blocks of the goal
+    }
+
+    private void markVisited(Mob golem, Location w) {
+        courierVisited.computeIfAbsent(golem.getUniqueId(), u -> new java.util.HashSet<>()).add(keyOf(w));
+    }
+
+    private long keyOf(Location l) {
+        return Block.getBlockKey(l.getBlockX(), l.getBlockY(), l.getBlockZ());
+    }
+
+    private void setCourierFinal(Mob golem, Location loc) {
+        String s = loc.getWorld().getName() + "," + loc.getBlockX() + ","
+                + loc.getBlockY() + "," + loc.getBlockZ();
+        golem.getPersistentDataContainer().set(courierFinalKey, PersistentDataType.STRING, s);
+    }
+
+    private Location getCourierFinal(Mob golem) {
+        String s = golem.getPersistentDataContainer().get(courierFinalKey, PersistentDataType.STRING);
+        if (s == null) return null;
+        String[] p = s.split(",");
+        if (p.length != 4) return null;
+        World w = Bukkit.getWorld(p[0]);
+        if (w == null) return null;
+        return new Location(w, Integer.parseInt(p[1]) + 0.5, Integer.parseInt(p[2]), Integer.parseInt(p[3]) + 0.5);
+    }
+
+    /** Distance from {@code from} to the CENTER of the block {@code blockLoc} points at. Normalises a
+     *  block-corner target (x.0) to its centre (x.5) so "standing right next to a solid container"
+     *  is measured honestly, whether the stored target was a corner or an already-centred waypoint. */
+    private double reachDist(Location from, Location blockLoc) {
+        double dx = from.getX() - (blockLoc.getBlockX() + 0.5);
+        double dy = from.getY() - (blockLoc.getBlockY() + 0.5);
+        double dz = from.getZ() - (blockLoc.getBlockZ() + 0.5);
+        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /** A standable location at/adjacent to the target block (fallback: just above the block). */
+    private Location safeSpotNear(Location target) {
+        World w = target.getWorld();
+        int bx = target.getBlockX(), by = target.getBlockY(), bz = target.getBlockZ();
+        int[][] off = {{0, 0}, {1, 0}, {-1, 0}, {0, 1}, {0, -1}};
+        for (int dy = 0; dy >= -1; dy--) {
+            for (int[] o : off) {
+                int x = bx + o[0], y = by + dy, z = bz + o[1];
+                Block feet = w.getBlockAt(x, y, z);
+                Block head = w.getBlockAt(x, y + 1, z);
+                Block below = w.getBlockAt(x, y - 1, z);
+                if (feet.isPassable() && head.isPassable() && below.getType().isSolid()) {
+                    return new Location(w, x + 0.5, y, z + 0.5);
+                }
+            }
+        }
+        return new Location(w, bx + 0.5, by + 1, bz + 0.5);
+    }
+
+    // ===== COURIER SEARCH & STATE HELPERS =====
+
+    /** Cached one-pass scan of nearby storage containers AND waypoint signs, refreshed ~every 10s
+     *  while the courier stays put. Cached handles are re-validated live on use. */
+    private ContainerCache courierScan(Mob golem, Location origin, int r) {
+        long now = Bukkit.getCurrentTick();
+        ContainerCache c = courierContainerCache.get(golem.getUniqueId());
+        if (c != null && now < c.expiry
+                && Math.abs(c.cx - origin.getBlockX()) <= 4 && Math.abs(c.cz - origin.getBlockZ()) <= 4) {
+            return c;
+        }
+        ContainerCache nc = new ContainerCache();
+        nc.expiry = now + 200; // ~10s at 20 TPS
+        nc.cx = origin.getBlockX();
+        nc.cz = origin.getBlockZ();
+        nc.list = new ArrayList<>();
+        nc.waypoints = new ArrayList<>();
+        World world = origin.getWorld();
+        int ox = origin.getBlockX(), oy = origin.getBlockY(), oz = origin.getBlockZ();
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
+                    Material t = b.getType();
+                    if (isStorageMaterial(t)) {
+                        nc.list.add(b);
+                    } else if (Tag.ALL_SIGNS.isTagged(t)
+                            && b.getState() instanceof Sign sign
+                            && signMatches(sign, plugin.cfg.waypointSignText)) {
+                        nc.waypoints.add(b.getLocation().add(0.5, 0, 0.5));
+                    }
+                }
+            }
+        }
+        courierContainerCache.put(golem.getUniqueId(), nc);
+        return nc;
+    }
+
+    /** Diagnostic for the courier GUI: why (or whether) a route can currently run. */
+    public String courierRouteStatus(Mob golem, CourierRoute route) {
+        if (route == null || !route.isConfigured()) return "UNCONFIGURED";
+        Location origin = golem.getLocation();
+        int r = plugin.cfg.courierSearchRadius;
+        List<Block> containers = collectStorageContainers(origin, r);
+
+        boolean anySourceTag = false, anyDestTag = false;
+        for (Block b : containers) {
+            if (!anySourceTag && containerHasTag(b, route.source)) anySourceTag = true;
+            if (!anyDestTag && containerHasTag(b, route.dest)) anyDestTag = true;
+        }
+        if (!anySourceTag) return "NO_SOURCE_TAG";
+        Block src = nearestSource(origin, containers, route);
+        if (src == null) return "SOURCE_EMPTY";
+        if (!anyDestTag) return "NO_DEST_TAG";
+        Block dst = nearestDest(origin, containers, route.dest);
+        if (dst == null) return "DEST_FULL";
+        // Matches courierDecide's self-churn guard: same container can't be both ends.
+        if (src.getLocation().equals(dst.getLocation())) return "SAME_CONTAINER";
+        return "OK";
+    }
+
+    /** The courier's current activity (state + what it carries), for the GUI status lore. */
+    public String courierActivity(Mob golem) {
+        String state = golem.getPersistentDataContainer()
+                .getOrDefault(stateKey, PersistentDataType.STRING, "COURIER_IDLE");
+        ItemStack hand = golem.getEquipment().getItemInMainHand();
+        boolean carrying = hand != null && hand.getType() != Material.AIR;
+        return state
+                + (carrying ? " (" + hand.getAmount() + "x " + hand.getType().name().toLowerCase() + ")" : "");
+    }
+
+    private List<Block> collectStorageContainers(Location origin, int r) {
+        World world = origin.getWorld();
+        int ox = origin.getBlockX(), oy = origin.getBlockY(), oz = origin.getBlockZ();
+        List<Block> out = new ArrayList<>();
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) { // couriers search the full box in every direction
+                for (int dz = -r; dz <= r; dz++) {
+                    Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
+                    if (isStorageMaterial(b.getType())) out.add(b);
+                }
+            }
+        }
+        return out;
+    }
+
+    private Block nearestSource(Location origin, List<Block> containers, CourierRoute route) {
+        Block best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (Block b : containers) {
+            if (!containerHasTag(b, route.source)) continue;
+            if (!(b.getState() instanceof Container c)) continue;
+            boolean hasCarryable = false;
+            for (ItemStack s : c.getInventory().getContents()) {
+                if (s != null && s.getType() != Material.AIR && route.carries(s.getType())) { hasCarryable = true; break; }
+            }
+            if (!hasCarryable) continue;
+            double d = b.getLocation().distanceSquared(origin);
+            if (d < bestDist) { bestDist = d; best = b; }
+        }
+        return best;
+    }
+
+    private Block nearestDest(Location origin, List<Block> containers, String tag) {
+        Block best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (Block b : containers) {
+            if (!containerHasTag(b, tag)) continue;
+            if (!(b.getState() instanceof Container c) || isContainerFull(c)) continue;
+            double d = b.getLocation().distanceSquared(origin);
+            if (d < bestDist) { bestDist = d; best = b; }
+        }
+        return best;
+    }
+
+    private Block findCourierDest(Location origin, String tag, int r) {
+        return scanCourierContainer(origin, r, b ->
+                containerHasTag(b, tag)
+                        && b.getState() instanceof Container c && !isContainerFull(c));
+    }
+
+    private Block scanCourierContainer(Location origin, int r, java.util.function.Predicate<Block> ok) {
+        World world = origin.getWorld();
+        int ox = origin.getBlockX(), oy = origin.getBlockY(), oz = origin.getBlockZ();
+        Block best = null;
+        double bestDist = Double.MAX_VALUE;
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -r; dy <= r; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
+                    if (!isStorageMaterial(b.getType())) continue;
+                    if (!ok.test(b)) continue;
+                    double d = b.getLocation().distanceSquared(origin);
+                    if (d < bestDist) { bestDist = d; best = b; }
+                }
+            }
+        }
+        return best;
+    }
+
+    private List<CourierRoute> getCourierRoutes(Mob golem) {
+        return CourierRoute.parse(
+                golem.getPersistentDataContainer().get(plugin.courierRoutesKey, PersistentDataType.STRING));
+    }
+
+    private CourierRoute activeCourierRoute(Mob golem) {
+        int idx = golem.getPersistentDataContainer().getOrDefault(courierActiveKey, PersistentDataType.INTEGER, -1);
+        List<CourierRoute> routes = getCourierRoutes(golem);
+        if (idx < 0 || idx >= routes.size()) return null;
+        return routes.get(idx);
+    }
+
+    private void setCourierState(Mob golem, String state) {
+        golem.getPersistentDataContainer().set(stateKey, PersistentDataType.STRING, state);
+    }
+
+    private void setCourierDest(Mob golem, Location loc) {
+        String s = loc.getWorld().getName() + "," + loc.getBlockX() + ","
+                + loc.getBlockY() + "," + loc.getBlockZ();
+        golem.getPersistentDataContainer().set(courierDestKey, PersistentDataType.STRING, s);
+    }
+
+    private Location getCourierDest(Mob golem) {
+        String s = golem.getPersistentDataContainer().get(courierDestKey, PersistentDataType.STRING);
+        if (s == null) return null;
+        String[] p = s.split(",");
+        if (p.length != 4) return null;
+        World w = Bukkit.getWorld(p[0]);
+        if (w == null) return null;
+        return new Location(w, Integer.parseInt(p[1]) + 0.5, Integer.parseInt(p[2]), Integer.parseInt(p[3]) + 0.5);
+    }
+
+    private void clearCourierJob(Mob golem) {
+        golem.getPersistentDataContainer().remove(courierActiveKey);
+        golem.getPersistentDataContainer().remove(courierDestKey);
+        golem.getPersistentDataContainer().remove(courierFinalKey);
+        courierVisited.remove(golem.getUniqueId());
+    }
+
+    private void abortCourier(Mob golem) {
+        clearCourierJob(golem);
+        setCourierState(golem, "COURIER_IDLE");
+    }
+
     // ===== SMELTER BLOCK SEARCH =====
 
     /** Result of a single station scan: all furnaces plus the nearest chest per sign type. */
@@ -801,7 +1366,7 @@ public class GolemTicker extends BukkitRunnable {
                 for (int dz = -r; dz <= r; dz++) {
                     Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
                     Material t = b.getType();
-                    if (t == Material.FURNACE) {
+                    if (isFurnaceMaterial(t)) {
                         scan.furnaces.add(b);
                         continue;
                     }
@@ -832,6 +1397,20 @@ public class GolemTicker extends BukkitRunnable {
     private boolean isStorageMaterial(Material m) {
         return m == Material.CHEST || m == Material.TRAPPED_CHEST || m == Material.BARREL
                 || Tag.SHULKER_BOXES.isTagged(m);
+    }
+
+    /** Furnace-family blocks the smelter services: regular furnace, blast furnace, smoker. */
+    private boolean isFurnaceMaterial(Material m) {
+        return m == Material.FURNACE || m == Material.BLAST_FURNACE || m == Material.SMOKER;
+    }
+
+    /** Whether a furnace of the given block type can smelt {@code item} (routes ores→blast, food→smoker). */
+    private boolean furnaceAccepts(Material furnaceType, Material item) {
+        return switch (furnaceType) {
+            case BLAST_FURNACE -> plugin.blastableInputs.contains(item);
+            case SMOKER -> plugin.smokableInputs.contains(item);
+            default -> plugin.smeltableInputs.contains(item); // FURNACE
+        };
     }
 
     /** True if the container is tagged with {@code tag} — by its custom name (anvil) or an adjacent sign. */
@@ -1137,9 +1716,16 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private boolean canSearch(Mob golem) {
+        long now = Bukkit.getCurrentTick();
         long next = golem.getPersistentDataContainer()
                 .getOrDefault(nextSearchTickKey, PersistentDataType.LONG, 0L);
-        return Bukkit.getCurrentTick() >= next;
+        // getCurrentTick() counts from server start and resets to 0 on restart, but nextSearchTickKey
+        // persists in the golem's PDC. A value left over from a previous session sits far in the
+        // future and would freeze the golem for hours (it "stands ready but never moves" until the
+        // counter climbs back). If next is more than a full cooldown ahead, the counter reset — the
+        // cooldown is stale, so treat it as elapsed.
+        if (next > now + plugin.cfg.searchCooldownTicks) return true;
+        return now >= next;
     }
 
     private void delayNextSearch(Mob golem) {
