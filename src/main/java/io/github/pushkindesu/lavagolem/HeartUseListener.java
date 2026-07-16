@@ -23,10 +23,6 @@ import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.persistence.PersistentDataType;
 
-import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 
 public class HeartUseListener implements Listener {
 
@@ -67,6 +63,18 @@ public class HeartUseListener implements Listener {
         player.sendMessage(Component.text(plugin.msg.get("golem-spawned"), NamedTextColor.GOLD));
     }
 
+    private static String initialState(String role) {
+        if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "SMELTER_IDLE";
+        if (LavaGolemPlugin.ROLE_COURIER.equals(role)) return "COURIER_IDLE";
+        return "SEEKING_BUCKET";
+    }
+
+    private static String roleNameKey(String role) {
+        if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "smelter-name";
+        if (LavaGolemPlugin.ROLE_COURIER.equals(role)) return "courier-name";
+        return "golem-name";
+    }
+
     private void spawnLavaGolem(Location loc, String role) {
         CopperGolem golem = (CopperGolem) loc.getWorld().spawnEntity(loc, EntityType.COPPER_GOLEM);
 
@@ -77,8 +85,7 @@ public class HeartUseListener implements Listener {
                 plugin.roleKey, PersistentDataType.STRING, role);
         golem.getPersistentDataContainer().set(
                 new NamespacedKey(plugin, "state"),
-                PersistentDataType.STRING,
-                LavaGolemPlugin.ROLE_SMELTER.equals(role) ? "SMELTER_IDLE" : "SEEKING_BUCKET");
+                PersistentDataType.STRING, initialState(role));
         golem.getPersistentDataContainer().set(
                 plugin.lavaDeliveredKey, PersistentDataType.INTEGER, 0);
         golem.getPersistentDataContainer().set(
@@ -86,15 +93,15 @@ public class HeartUseListener implements Listener {
         golem.getPersistentDataContainer().set(
                 plugin.itemsSmeltedKey, PersistentDataType.INTEGER, 0);
         golem.getPersistentDataContainer().set(
+                plugin.itemsMovedKey, PersistentDataType.INTEGER, 0);
+        golem.getPersistentDataContainer().set(
                 plugin.createdAtKey, PersistentDataType.LONG, System.currentTimeMillis());
 
         golem.setInvulnerable(true);
         golem.setPersistent(true);
         golem.setRemoveWhenFarAway(false);
         golem.setVisualFire(true);
-        golem.customName(Component.text(plugin.msg.get(
-                LavaGolemPlugin.ROLE_SMELTER.equals(role) ? "smelter-name" : "golem-name"),
-                NamedTextColor.GOLD));
+        golem.customName(Component.text(plugin.msg.get(roleNameKey(role)), NamedTextColor.GOLD));
         golem.setCustomNameVisible(true);
         golem.setWeatheringState(WeatheringCopperState.UNAFFECTED);
 
@@ -102,47 +109,33 @@ public class HeartUseListener implements Listener {
         plugin.cleanedUpGolems.add(golem.getUniqueId());
     }
 
-    /** Recreates a golem that was loaded from disk, restoring all its state. */
-    public void spawnLavaGolemRestored(
-            Location loc, String role, String mode, String state, String target,
-            int lavaDelivered, int bucketsTaken, int itemsSmelted, long createdAt,
-            ItemStack heldItem, String jobFurnace, Integer jobAmount, String jobMaterial) {
+    /**
+     * Recreates a golem loaded from disk, restoring ALL of its PDC state by copying the raw
+     * container (so any current or future key survives a chunk reload without hand-threading).
+     */
+    public void spawnLavaGolemRestored(Location loc, byte[] pdcBytes, String role, ItemStack heldItem) {
         CopperGolem golem =
                 (CopperGolem) loc.getWorld().spawnEntity(loc, EntityType.COPPER_GOLEM);
 
         var pdc = golem.getPersistentDataContainer();
-        pdc.set(plugin.golemEntityKey, PersistentDataType.BYTE, (byte) 1);
-        pdc.set(plugin.roleKey, PersistentDataType.STRING,
-                role != null ? role : LavaGolemPlugin.ROLE_HAULER);
-        if (mode != null) {
-            pdc.set(plugin.modeKey, PersistentDataType.STRING, mode);
+        boolean restored = false;
+        if (pdcBytes != null) {
+            try { pdc.readFromBytes(pdcBytes, true); restored = true; }
+            catch (java.io.IOException ignored) { /* fall back below */ }
         }
-        pdc.set(new NamespacedKey(plugin, "state"),
-                PersistentDataType.STRING, state != null ? state : "SEEKING_BUCKET");
-        if (target != null) {
-            pdc.set(new NamespacedKey(plugin, "target"), PersistentDataType.STRING, target);
+        if (!restored) {
+            // Fallback: keep it recognised as ours with a sane starting state.
+            pdc.set(plugin.golemEntityKey, PersistentDataType.BYTE, (byte) 1);
+            pdc.set(plugin.roleKey, PersistentDataType.STRING,
+                    role != null ? role : LavaGolemPlugin.ROLE_HAULER);
+            pdc.set(new NamespacedKey(plugin, "state"), PersistentDataType.STRING, initialState(role));
         }
-        if (jobFurnace != null) {
-            pdc.set(new NamespacedKey(plugin, "job_furnace"), PersistentDataType.STRING, jobFurnace);
-        }
-        if (jobAmount != null) {
-            pdc.set(new NamespacedKey(plugin, "job_amount"), PersistentDataType.INTEGER, jobAmount);
-        }
-        if (jobMaterial != null) {
-            pdc.set(new NamespacedKey(plugin, "job_material"), PersistentDataType.STRING, jobMaterial);
-        }
-        pdc.set(plugin.lavaDeliveredKey, PersistentDataType.INTEGER, lavaDelivered);
-        pdc.set(plugin.bucketsTakenKey, PersistentDataType.INTEGER, bucketsTaken);
-        pdc.set(plugin.itemsSmeltedKey, PersistentDataType.INTEGER, itemsSmelted);
-        pdc.set(plugin.createdAtKey, PersistentDataType.LONG, createdAt);
 
         golem.setInvulnerable(true);
         golem.setPersistent(true);
         golem.setRemoveWhenFarAway(false);
         golem.setVisualFire(true);
-        golem.customName(Component.text(plugin.msg.get(
-                LavaGolemPlugin.ROLE_SMELTER.equals(role) ? "smelter-name" : "golem-name"),
-                NamedTextColor.GOLD));
+        golem.customName(Component.text(plugin.msg.get(roleNameKey(role)), NamedTextColor.GOLD));
         golem.setCustomNameVisible(true);
         golem.setWeatheringState(WeatheringCopperState.UNAFFECTED);
 
@@ -173,39 +166,16 @@ public class HeartUseListener implements Listener {
                 Location loc = old.getLocation();
                 String role = pdc.getOrDefault(plugin.roleKey,
                         PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
-                String mode = pdc.get(plugin.modeKey, PersistentDataType.STRING);
-                String state = pdc.getOrDefault(
-                        new NamespacedKey(plugin, "state"),
-                        PersistentDataType.STRING, "SEEKING_BUCKET");
-                String storedTarget = pdc.get(
-                        new NamespacedKey(plugin, "target"),
-                        PersistentDataType.STRING);
-                String jobFurnace = pdc.get(
-                        new NamespacedKey(plugin, "job_furnace"),
-                        PersistentDataType.STRING);
-                Integer jobAmount = pdc.get(
-                        new NamespacedKey(plugin, "job_amount"),
-                        PersistentDataType.INTEGER);
-                String jobMaterial = pdc.get(
-                        new NamespacedKey(plugin, "job_material"),
-                        PersistentDataType.STRING);
-                int lavaDelivered = pdc.getOrDefault(plugin.lavaDeliveredKey,
-                        PersistentDataType.INTEGER, 0);
-                int bucketsTaken = pdc.getOrDefault(plugin.bucketsTakenKey,
-                        PersistentDataType.INTEGER, 0);
-                int itemsSmelted = pdc.getOrDefault(plugin.itemsSmeltedKey,
-                        PersistentDataType.INTEGER, 0);
-                long createdAt = pdc.getOrDefault(plugin.createdAtKey,
-                        PersistentDataType.LONG, System.currentTimeMillis());
+                byte[] pdcBytes;
+                try { pdcBytes = pdc.serializeToBytes(); }
+                catch (java.io.IOException e) { pdcBytes = null; }
                 ItemStack held = (old.getEquipment() != null)
                         ? old.getEquipment().getItemInMainHand() : null;
 
                 plugin.cleanedUpGolems.remove(old.getUniqueId());
                 old.remove();
 
-                spawnLavaGolemRestored(loc, role, mode, state, storedTarget,
-                        lavaDelivered, bucketsTaken, itemsSmelted, createdAt, held,
-                        jobFurnace, jobAmount, jobMaterial);
+                spawnLavaGolemRestored(loc, pdcBytes, role, held);
             }
         });
     }
@@ -246,36 +216,14 @@ public class HeartUseListener implements Listener {
 
         } else if (!player.isSneaking()
                 && player.getInventory().getItemInMainHand().getType() == Material.AIR) {
-            // Empty hand (no sneak): smelter opens its settings/stats GUI; hauler shows chat stats.
-            var pdc = golem.getPersistentDataContainer();
-            String role = pdc.getOrDefault(plugin.roleKey, PersistentDataType.STRING,
-                    LavaGolemPlugin.ROLE_HAULER);
-            if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) {
-                plugin.golemMenu.open(player, golem);
-                return;
+            // Empty hand (no sneak): open the golem's GUI (courier = routes, others = stats/settings).
+            String role = golem.getPersistentDataContainer().getOrDefault(
+                    plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
+            if (LavaGolemPlugin.ROLE_COURIER.equals(role)) {
+                plugin.courierMenu.open(player, golem);
+            } else {
+                plugin.golemMenu.open(player, golem); // hauler (stats) & smelter (modes + stats)
             }
-            long createdAt = pdc.getOrDefault(plugin.createdAtKey, PersistentDataType.LONG, 0L);
-
-            String dateStr = (createdAt == 0L)
-                    ? plugin.msg.get("stats-since-unknown")
-                    : DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")
-                        .format(LocalDateTime.ofInstant(
-                                Instant.ofEpochMilli(createdAt), ZoneId.systemDefault()));
-
-            int lavaDelivered = pdc.getOrDefault(plugin.lavaDeliveredKey, PersistentDataType.INTEGER, 0);
-            int bucketsTaken  = pdc.getOrDefault(plugin.bucketsTakenKey,  PersistentDataType.INTEGER, 0);
-            player.sendMessage(Component.text()
-                    .append(Component.text(plugin.msg.get("stats-header"), NamedTextColor.GOLD))
-                    .append(Component.newline())
-                    .append(Component.text(plugin.msg.get("stats-delivered"), NamedTextColor.GRAY))
-                    .append(Component.text(lavaDelivered, NamedTextColor.WHITE))
-                    .append(Component.newline())
-                    .append(Component.text(plugin.msg.get("stats-buckets"), NamedTextColor.GRAY))
-                    .append(Component.text(bucketsTaken, NamedTextColor.WHITE))
-                    .append(Component.newline())
-                    .append(Component.text(plugin.msg.get("stats-since"), NamedTextColor.GRAY))
-                    .append(Component.text(dateStr, NamedTextColor.WHITE))
-                    .build());
         }
     }
 }

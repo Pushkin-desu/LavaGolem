@@ -50,20 +50,36 @@ public class GolemMenu implements Listener {
         public Inventory getInventory() { return inventory; }
     }
 
-    /** Opens the settings menu for the given smelter golem. */
+    /** Opens the settings menu for the given golem. */
     public void open(Player player, Mob golem) {
+        plugin.markMenuOpen(golem); // hold the golem still while its menu is open
+        boolean smelter = isSmelter(golem);
         Holder holder = new Holder(golem.getUniqueId());
         Inventory inv = Bukkit.createInventory(holder, 9,
-                Component.text(plugin.msg.get("smelter-menu-title"), NamedTextColor.DARK_GRAY));
+                Component.text(plugin.msg.get(smelter ? "smelter-menu-title" : "hauler-menu-title"),
+                        NamedTextColor.DARK_GRAY));
         holder.inventory = inv;
         render(inv, golem);
         player.openInventory(inv);
     }
 
+    private boolean isSmelter(Mob golem) {
+        return LavaGolemPlugin.ROLE_SMELTER.equals(golem.getPersistentDataContainer()
+                .getOrDefault(plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER));
+    }
+
     private void render(Inventory inv, Mob golem) {
+        ItemStack filler = filler();
+        for (int i = 0; i < 9; i++) inv.setItem(i, filler);
+
+        if (!isSmelter(golem)) {
+            // Lava Hauler: stats-only view (no work modes).
+            inv.setItem(4, haulerStatsItem(golem));
+            return;
+        }
+
         String current = golem.getPersistentDataContainer()
                 .getOrDefault(plugin.modeKey, PersistentDataType.STRING, LavaGolemPlugin.MODE_BALANCED);
-
         inv.setItem(0, modeButton(Material.FURNACE, "mode-balanced-name", "mode-balanced-desc",
                 LavaGolemPlugin.MODE_BALANCED.equals(current)));
         inv.setItem(1, modeButton(Material.IRON_ORE, "mode-load-name", "mode-load-desc",
@@ -73,9 +89,31 @@ public class GolemMenu implements Listener {
         inv.setItem(2, modeButton(Material.IRON_INGOT, "mode-collect-name", "mode-collect-desc",
                 LavaGolemPlugin.MODE_COLLECT_ONLY.equals(current)));
         inv.setItem(4, statsItem(golem));
+    }
 
-        ItemStack filler = filler();
-        for (int i : new int[]{3, 5, 6, 7, 8}) inv.setItem(i, filler);
+    private ItemStack haulerStatsItem(Mob golem) {
+        var pdc = golem.getPersistentDataContainer();
+        int lava = pdc.getOrDefault(plugin.lavaDeliveredKey, PersistentDataType.INTEGER, 0);
+        int buckets = pdc.getOrDefault(plugin.bucketsTakenKey, PersistentDataType.INTEGER, 0);
+        long createdAt = pdc.getOrDefault(plugin.createdAtKey, PersistentDataType.LONG, 0L);
+        String dateStr = (createdAt == 0L)
+                ? plugin.msg.get("stats-since-unknown")
+                : DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")
+                        .format(LocalDateTime.ofInstant(Instant.ofEpochMilli(createdAt), ZoneId.systemDefault()));
+        ItemStack item = new ItemStack(Material.PAPER);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(Component.text(plugin.msg.get("menu-stats-name"), NamedTextColor.GOLD)
+                .decoration(TextDecoration.ITALIC, false));
+        meta.lore(List.of(
+                Component.text(plugin.msg.get("stats-delivered") + lava, NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text(plugin.msg.get("stats-buckets") + buckets, NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text(plugin.msg.get("stats-since") + dateStr, NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false)
+        ));
+        item.setItemMeta(meta);
+        return item;
     }
 
     private ItemStack modeButton(Material icon, String nameKey, String descKey, boolean selected) {
@@ -150,6 +188,7 @@ public class GolemMenu implements Listener {
             event.getWhoClicked().closeInventory();
             return;
         }
+        if (!isSmelter(golem)) return; // hauler view has no work modes
         golem.getPersistentDataContainer().set(plugin.modeKey, PersistentDataType.STRING, mode);
         render(event.getInventory(), golem);
         if (event.getWhoClicked() instanceof Player p) {
@@ -161,6 +200,13 @@ public class GolemMenu implements Listener {
     public void onDrag(InventoryDragEvent event) {
         if (event.getInventory().getHolder() instanceof Holder) {
             event.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onClose(org.bukkit.event.inventory.InventoryCloseEvent event) {
+        if (event.getInventory().getHolder() instanceof Holder holder) {
+            plugin.markMenuClosed(holder.golemId); // resume the golem once its menu is closed
         }
     }
 }
