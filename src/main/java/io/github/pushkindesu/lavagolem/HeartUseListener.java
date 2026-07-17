@@ -66,13 +66,21 @@ public class HeartUseListener implements Listener {
     private static String initialState(String role) {
         if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "SMELTER_IDLE";
         if (LavaGolemPlugin.ROLE_COURIER.equals(role)) return "COURIER_IDLE";
+        if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) return "ALCHEMIST_IDLE";
         return "SEEKING_BUCKET";
     }
 
     private static String roleNameKey(String role) {
         if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "smelter-name";
         if (LavaGolemPlugin.ROLE_COURIER.equals(role)) return "courier-name";
+        if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) return "alchemist-name";
         return "golem-name";
+    }
+
+    /** Only the Lava Golem burns — it hauls lava, so the flame reads as "that's the lava one" from
+     *  a distance, where the name tag doesn't. Purely visual: it deals no damage. */
+    private static boolean burns(String role) {
+        return role == null || LavaGolemPlugin.ROLE_HAULER.equals(role);
     }
 
     private void spawnLavaGolem(Location loc, String role) {
@@ -95,12 +103,14 @@ public class HeartUseListener implements Listener {
         golem.getPersistentDataContainer().set(
                 plugin.itemsMovedKey, PersistentDataType.INTEGER, 0);
         golem.getPersistentDataContainer().set(
+                plugin.potionsBrewedKey, PersistentDataType.INTEGER, 0);
+        golem.getPersistentDataContainer().set(
                 plugin.createdAtKey, PersistentDataType.LONG, System.currentTimeMillis());
 
         golem.setInvulnerable(true);
         golem.setPersistent(true);
         golem.setRemoveWhenFarAway(false);
-        golem.setVisualFire(true);
+        golem.setVisualFire(burns(role));
         golem.customName(Component.text(plugin.msg.get(roleNameKey(role)), NamedTextColor.GOLD));
         golem.setCustomNameVisible(true);
         golem.setWeatheringState(WeatheringCopperState.UNAFFECTED);
@@ -134,7 +144,7 @@ public class HeartUseListener implements Listener {
         golem.setInvulnerable(true);
         golem.setPersistent(true);
         golem.setRemoveWhenFarAway(false);
-        golem.setVisualFire(true);
+        golem.setVisualFire(burns(role));
         golem.customName(Component.text(plugin.msg.get(roleNameKey(role)), NamedTextColor.GOLD));
         golem.setCustomNameVisible(true);
         golem.setWeatheringState(WeatheringCopperState.UNAFFECTED);
@@ -221,8 +231,10 @@ public class HeartUseListener implements Listener {
                     plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
             if (LavaGolemPlugin.ROLE_COURIER.equals(role)) {
                 plugin.courierMenu.open(player, golem);
+            } else if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) {
+                plugin.alchemistMenu.open(player, golem); // which potions to brew + stats
             } else {
-                plugin.golemMenu.open(player, golem); // hauler (stats) & smelter (modes + stats)
+                plugin.golemMenu.open(player, golem); // smelter (modes + stats), hauler (stats)
             }
         }
     }

@@ -41,6 +41,7 @@ public class GolemTicker extends BukkitRunnable {
     private final NamespacedKey courierDestKey;
     private final NamespacedKey courierRrKey;
     private final NamespacedKey courierFinalKey;
+    private final NamespacedKey alchemyJobKey;
     private int tickCount = 0;
 
     /** Transient per-golem "stuck" progress tracking for the courier's teleport fallback. */
@@ -79,6 +80,7 @@ public class GolemTicker extends BukkitRunnable {
         this.courierDestKey    = new NamespacedKey(plugin, "courier_dest");
         this.courierRrKey      = new NamespacedKey(plugin, "courier_rr");
         this.courierFinalKey   = new NamespacedKey(plugin, "courier_final");
+        this.alchemyJobKey     = new NamespacedKey(plugin, "alchemy_job");
     }
 
     @Override
@@ -106,6 +108,9 @@ public class GolemTicker extends BukkitRunnable {
         // once, on open, in markMenuOpen). It resumes on the next tick after the menu closes.
         if (plugin.isMenuOpen(golem.getUniqueId())) return;
 
+        // Switched off from its menu: park it until a player switches it back on.
+        if (plugin.isPaused(golem)) return;
+
         PersistentDataContainer pdc = golem.getPersistentDataContainer();
         String role = pdc.getOrDefault(plugin.roleKey, PersistentDataType.STRING,
                 LavaGolemPlugin.ROLE_HAULER);
@@ -114,6 +119,8 @@ public class GolemTicker extends BukkitRunnable {
             tickSmelter(golem, pdc);
         } else if (LavaGolemPlugin.ROLE_COURIER.equals(role)) {
             tickCourier(golem, pdc);
+        } else if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) {
+            tickAlchemist(golem, pdc);
         } else {
             tickHauler(golem, pdc);
         }
@@ -163,8 +170,8 @@ public class GolemTicker extends BukkitRunnable {
         // job — otherwise the next job's setItemInMainHand would overwrite and destroy it.
         ItemStack held = golem.getEquipment().getItemInMainHand();
         if (held != null && held.getType() != Material.AIR) {
-            Block dest = findTaggedContainer(origin, plugin.cfg.outputSignText, false);
-            if (dest == null) dest = findTaggedContainer(origin, plugin.cfg.bucketSignText, false);
+            Block dest = findTaggedContainer(origin, plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT), false);
+            if (dest == null) dest = findTaggedContainer(origin, plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BUCKETS), false);
             if (dest != null) {
                 clearSearchCooldown(golem);
                 setTarget(golem, dest.getLocation());
@@ -175,7 +182,7 @@ public class GolemTicker extends BukkitRunnable {
             return;
         }
 
-        StationScan scan = scanStation(origin);
+        StationScan scan = scanStation(golem, origin);
         List<Block> furnaces = scan.furnaces;
         if (furnaces.isEmpty()) { delayNextSearch(golem); return; }
 
@@ -481,7 +488,8 @@ public class GolemTicker extends BukkitRunnable {
         }
 
         // Hand full or no more same-type results nearby — deliver.
-        Block outputChest = findTaggedContainer(golem.getLocation(), plugin.cfg.outputSignText, false);
+        Block outputChest = findTaggedContainer(golem.getLocation(),
+                plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT), false);
         if (outputChest == null) {
             // No output chest (misconfigured station) — keep the item and idle.
             setSmelterState(golem, "SMELTER_IDLE");
@@ -590,9 +598,11 @@ public class GolemTicker extends BukkitRunnable {
 
         // Empty buckets go to the station's [Output] chest (no separate [Buckets] sign needed);
         // fall back to [Buckets] so the item is never lost if a station has no output chest.
-        Block dest = findTaggedContainer(golem.getLocation(), plugin.cfg.outputSignText, false);
+        Block dest = findTaggedContainer(golem.getLocation(),
+                plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT), false);
         if (dest == null) {
-            dest = findTaggedContainer(golem.getLocation(), plugin.cfg.bucketSignText, false);
+            dest = findTaggedContainer(golem.getLocation(),
+                    plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BUCKETS), false);
         }
         if (dest == null) {
             setSmelterState(golem, "SMELTER_IDLE");
@@ -828,6 +838,827 @@ public class GolemTicker extends BukkitRunnable {
         } else {
             golem.getPathfinder().moveTo(target, 1.0);
         }
+    }
+
+    // ===== ALCHEMIST =====
+
+    /*
+     * Brewing knowledge is HAND-MAINTAINED, unlike the smelter's inputs which are discovered by
+     * scanning recipes: vanilla potion mixes cannot be read back from the API (PotionBrewer only
+     * exposes addPotionMix/removePotionMix — there is no getter), so the golem has to be told the
+     * shape of vanilla brewing. Keeping it staged (water -> base -> effect -> one modifier) means we
+     * never need the full recipe graph, only which role an ingredient plays.
+     */
+
+    /** Turns a WATER bottle into the AWKWARD base every real potion is built on. */
+    private static final java.util.Set<Material> BREW_BASE = java.util.EnumSet.of(Material.NETHER_WART);
+
+    /** Alters an already-brewed potion (duration / power / splash / lingering / corrupt). */
+    private static final java.util.Set<Material> BREW_MODIFIERS = java.util.EnumSet.of(
+            Material.REDSTONE, Material.GLOWSTONE_DUST, Material.GUNPOWDER,
+            Material.DRAGON_BREATH, Material.FERMENTED_SPIDER_EYE);
+
+    /** Turns an AWKWARD base into an actual effect potion. */
+    private static final java.util.Set<Material> BREW_EFFECTS = java.util.EnumSet.of(
+            Material.SUGAR, Material.GLISTERING_MELON_SLICE, Material.SPIDER_EYE,
+            Material.MAGMA_CREAM, Material.GHAST_TEAR, Material.BLAZE_POWDER,
+            Material.RABBIT_FOOT, Material.PUFFERFISH, Material.GOLDEN_CARROT,
+            Material.PHANTOM_MEMBRANE, Material.TURTLE_HELMET, Material.BREEZE_ROD,
+            Material.SLIME_BLOCK, Material.STONE, Material.COBWEB);
+
+    /** Which potion each effect ingredient produces — drives the real potion icons in the GUI, and
+     *  lets a player switch individual potions off. Hand-maintained for the same reason as above. */
+    public static final Map<Material, org.bukkit.potion.PotionType> BREW_RESULTS = new java.util.LinkedHashMap<>();
+    static {
+        BREW_RESULTS.put(Material.GLISTERING_MELON_SLICE, org.bukkit.potion.PotionType.HEALING);
+        BREW_RESULTS.put(Material.GHAST_TEAR,             org.bukkit.potion.PotionType.REGENERATION);
+        BREW_RESULTS.put(Material.BLAZE_POWDER,           org.bukkit.potion.PotionType.STRENGTH);
+        BREW_RESULTS.put(Material.SUGAR,                  org.bukkit.potion.PotionType.SWIFTNESS);
+        BREW_RESULTS.put(Material.RABBIT_FOOT,            org.bukkit.potion.PotionType.LEAPING);
+        BREW_RESULTS.put(Material.MAGMA_CREAM,            org.bukkit.potion.PotionType.FIRE_RESISTANCE);
+        BREW_RESULTS.put(Material.PUFFERFISH,             org.bukkit.potion.PotionType.WATER_BREATHING);
+        BREW_RESULTS.put(Material.GOLDEN_CARROT,          org.bukkit.potion.PotionType.NIGHT_VISION);
+        BREW_RESULTS.put(Material.SPIDER_EYE,             org.bukkit.potion.PotionType.POISON);
+        BREW_RESULTS.put(Material.PHANTOM_MEMBRANE,       org.bukkit.potion.PotionType.SLOW_FALLING);
+        BREW_RESULTS.put(Material.TURTLE_HELMET,          org.bukkit.potion.PotionType.TURTLE_MASTER);
+        BREW_RESULTS.put(Material.BREEZE_ROD,             org.bukkit.potion.PotionType.WIND_CHARGED);
+        BREW_RESULTS.put(Material.SLIME_BLOCK,            org.bukkit.potion.PotionType.OOZING);
+        BREW_RESULTS.put(Material.STONE,                  org.bukkit.potion.PotionType.INFESTED);
+        BREW_RESULTS.put(Material.COBWEB,                 org.bukkit.potion.PotionType.WEAVING);
+    }
+
+    /** Modifier ingredients in the order the GUI lists them. */
+    public static final List<Material> BREW_MODIFIER_ORDER = List.of(
+            Material.REDSTONE, Material.GLOWSTONE_DUST, Material.GUNPOWDER,
+            Material.DRAGON_BREATH, Material.FERMENTED_SPIDER_EYE);
+
+    /** Whether this golem is allowed to use {@code m} (everything is allowed until switched off). */
+    public boolean alchemyAllows(Mob golem, Material m) {
+        String s = golem.getPersistentDataContainer()
+                .get(plugin.alchemyDisabledKey, PersistentDataType.STRING);
+        if (s == null || s.isEmpty()) return true;
+        for (String part : s.split(",")) {
+            if (part.equals(m.name())) return false;
+        }
+        return true;
+    }
+
+    public void setAlchemyAllowed(Mob golem, Material m, boolean allowed) {
+        java.util.Set<String> disabled = new java.util.LinkedHashSet<>();
+        String s = golem.getPersistentDataContainer()
+                .get(plugin.alchemyDisabledKey, PersistentDataType.STRING);
+        if (s != null && !s.isEmpty()) java.util.Collections.addAll(disabled, s.split(","));
+        if (allowed) disabled.remove(m.name()); else disabled.add(m.name());
+        golem.getPersistentDataContainer().set(plugin.alchemyDisabledKey,
+                PersistentDataType.STRING, String.join(",", disabled));
+    }
+
+    /** What the golem is currently fetching for a stand. */
+    private static final String JOB_FUEL = "FUEL", JOB_BOTTLE = "BOTTLE", JOB_INGREDIENT = "INGREDIENT";
+    /** An already-brewed potion taken from [Brew] to carry another stage — an awkward base, or a
+     *  finished potion the player dropped back in to have a modifier applied. */
+    private static final String JOB_POTION_BASE = "POTION_BASE";
+    /** Grinding blaze rods into powder and restocking [Brew] with it. */
+    private static final String JOB_GRIND = "GRIND";
+
+    private void tickAlchemist(Mob golem, PersistentDataContainer pdc) {
+        // Alchemical haze, so an alchemist reads at a glance from a distance (the hauler burns).
+        // Particles rather than a real PotionEffect: an effect would actually act on the entity.
+        golem.getWorld().spawnParticle(org.bukkit.Particle.WITCH,
+                golem.getLocation().add(0, 1.0, 0), 3, 0.25, 0.3, 0.25, 0.0);
+
+        String state = pdc.getOrDefault(stateKey, PersistentDataType.STRING, "ALCHEMIST_IDLE");
+        switch (state) {
+            case "ALCHEMIST_IDLE"      -> alchemistDecide(golem);
+            case "ALCHEMIST_FETCH"     -> moveToTargetAlchemist(golem, this::onReachBrewChest);
+            case "ALCHEMIST_TO_WATER"  -> moveToTargetAlchemist(golem, this::onReachWater);
+            case "ALCHEMIST_TO_CRAFT"  -> moveToTargetAlchemist(golem, this::onReachCraftingTable);
+            case "ALCHEMIST_TO_STAND"  -> moveToTargetAlchemist(golem, this::onReachStandLoad);
+            case "ALCHEMIST_COLLECT"   -> moveToTargetAlchemist(golem, this::onReachStandCollect);
+            case "ALCHEMIST_TO_OUTPUT" -> moveToTargetAlchemist(golem, this::onReachAlchemyOutput);
+            default -> setAlchemistState(golem, "ALCHEMIST_IDLE");
+        }
+    }
+
+    /** Core decision engine: picks the single best action for an idle alchemist. */
+    private void alchemistDecide(Mob golem) {
+        if (!canSearch(golem)) return;
+        Location origin = golem.getLocation();
+
+        // Safety net (same invariant as the smelter): never sit idle holding an item, because
+        // starting a job overwrites the main hand and would destroy it. Finished potions go to
+        // [Output]; anything else (spare powder from grinding a rod, an unplaced bottle) goes back
+        // to [Brew] so it stays in circulation instead of silting up the output chest.
+        ItemStack held = golem.getEquipment().getItemInMainHand();
+        if (held != null && held.getType() != Material.AIR) {
+            boolean finished = isPotionItem(held.getType()) && !isWaterBottle(held);
+            String outTag = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT);
+            String brewTag = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BREW);
+            String first = finished ? outTag : brewTag;
+            String second = finished ? brewTag : outTag;
+            Block dest = findTaggedContainer(origin, first, false);
+            if (dest == null) dest = findTaggedContainer(origin, second, false);
+            if (dest != null) {
+                clearSearchCooldown(golem);
+                setTarget(golem, dest.getLocation());
+                setAlchemistState(golem, "ALCHEMIST_TO_OUTPUT");
+            } else {
+                delayNextSearch(golem);
+            }
+            return;
+        }
+
+        AlchemyScan scan = scanAlchemyStation(golem, origin);
+        if (scan.stands.isEmpty() || scan.brewChest == null
+                || !(scan.brewChest.getState() instanceof Container brew)) {
+            delayNextSearch(golem);
+            return;
+        }
+
+        // Keep the pantry stocked before servicing any stand. Blaze powder is BOTH the fuel and the
+        // Strength ingredient, and rods are just how players store it — so grind one into the chest
+        // and let the normal fuel/ingredient jobs find powder there. Doing it here, rather than
+        // inside the fuel step, is why rods now work for Strength too and not only for fuel.
+        if (scan.craftingTable != null
+                && !containsMaterial(brew, Material.BLAZE_POWDER)
+                && containsMaterial(brew, Material.BLAZE_ROD)) {
+            clearSearchCooldown(golem);
+            clearJobFurnace(golem);
+            setJobMaterial(golem, Material.BLAZE_ROD);
+            golem.getPersistentDataContainer().set(alchemyJobKey, PersistentDataType.STRING, JOB_GRIND);
+            setTarget(golem, scan.brewChest.getLocation());
+            setAlchemistState(golem, "ALCHEMIST_FETCH");
+            return;
+        }
+
+        // How many potions [Output] can actually take. Potions never stack, so each one needs a
+        // WHOLE empty slot — "is the chest full" is the wrong question (a chest with no empty slot
+        // but a part-used stack of redstone isn't "full", yet a potion still won't fit).
+        Container outChest = scan.outputChest != null
+                && scan.outputChest.getState() instanceof Container c ? c : null;
+        int deliverable = outChest == null ? 0 : emptySlots(outChest);
+        boolean canDeliver = deliverable > 0;
+
+        // Potions already promised to that chest: everything sitting in a bottle slot anywhere will
+        // want a slot of its own eventually. Counting them stops the golem loading three bottles
+        // against one free slot and stranding the other two.
+        int committed = 0;
+        for (Block sb : scan.stands) {
+            if (sb.getState() instanceof org.bukkit.block.BrewingStand s) {
+                committed += countBottles(s.getInventory());
+            }
+        }
+
+        // Sort stands by distance so the golem always services the closest one that needs something.
+        scan.stands.sort(java.util.Comparator.comparingDouble(b -> b.getLocation().distanceSquared(origin)));
+
+        for (Block standBlock : scan.stands) {
+            if (!(standBlock.getState() instanceof org.bukkit.block.BrewingStand stand)) continue;
+            var inv = stand.getInventory();
+
+            // An occupied ingredient slot means the stand is brewing (vanilla consumes the
+            // ingredient when it finishes) — or the player is driving it by hand. Either way, leave it.
+            ItemStack ingredient = inv.getIngredient();
+            if (ingredient != null && ingredient.getType() != Material.AIR) continue;
+
+            // 1) COLLECT — unload FIRST, and drain the stand completely before touching it again.
+            //    Potions come out one at a time (they don't stack), so if loading could interleave,
+            //    the freed slot would tempt the golem into starting a new batch on top of a
+            //    half-collected one — leaving finished potions stranded and mixing two batches.
+            if (collectableBottleSlot(golem, inv, brew) >= 0) {
+                if (canDeliver) {
+                    clearSearchCooldown(golem);
+                    setJobFurnace(golem, standBlock.getLocation());
+                    setTarget(golem, standBlock.getLocation());
+                    setAlchemistState(golem, "ALCHEMIST_COLLECT");
+                    return;
+                }
+                continue; // nowhere to put them: leave the batch be rather than brew over it
+            }
+
+            // 2) FUEL — nothing brews without it. Only ever stage ONE blaze powder: a single pinch
+            //    is 20 brews, so hoarding a stack here would starve Strength potions of powder.
+            ItemStack fuelSlot = inv.getFuel();
+            boolean fuelSlotEmpty = fuelSlot == null || fuelSlot.getType() == Material.AIR;
+            //    (Rods are already ground into powder by the pantry step above, so this only ever
+            //    has to look for powder.)
+            if (stand.getFuelLevel() <= 0 && fuelSlotEmpty && standHasBottles(inv)
+                    && containsMaterial(brew, Material.BLAZE_POWDER)) {
+                startAlchemyFetch(golem, standBlock, JOB_FUEL, Material.BLAZE_POWDER, scan);
+                return;
+            }
+
+            // 3) BOTTLES — fill empty bottle slots before adding an ingredient, so brewing starts
+            //    the moment the ingredient lands (and one ingredient serves all three bottles).
+            // Never load a bottle we couldn't hand in: one free slot in [Output] buys one bottle,
+            // not a full batch of three.
+            if (freeBottleSlot(inv) >= 0 && committed < deliverable) {
+                org.bukkit.potion.PotionType stage = standStage(inv);
+                // A potion already sitting in [Brew] that we can carry further beats starting from
+                // scratch: it skips the whole water+wart trip, and it's exactly how a player asks
+                // for another stage (drop the potion back in the chest). Only take one matching what
+                // the stand already holds — all three bottles brew together.
+                if (findAdvanceable(golem, brew, stage) != null) {
+                    startAlchemyFetch(golem, standBlock, JOB_POTION_BASE, Material.POTION, scan);
+                    return;
+                }
+                // Otherwise start fresh from water — but only a batch we can actually finish: with
+                // no target potion switched on (or no wart), this would just park water in the stand.
+                if ((stage == null || stage == org.bukkit.potion.PotionType.WATER)
+                        && canBrewTarget(golem, brew)) {
+                    if (containsWaterBottle(brew)) {
+                        startAlchemyFetch(golem, standBlock, JOB_BOTTLE, Material.POTION, scan);
+                        return;
+                    }
+                    if (containsMaterial(brew, Material.GLASS_BOTTLE) && scan.water != null) {
+                        startAlchemyFetch(golem, standBlock, JOB_BOTTLE, Material.GLASS_BOTTLE, scan);
+                        return;
+                    }
+                }
+            }
+
+            // 4) INGREDIENT — what the stand needs depends on what stage its bottles are at.
+            Material want = neededIngredient(golem, inv, brew);
+            if (want != null) {
+                startAlchemyFetch(golem, standBlock, JOB_INGREDIENT, want, scan);
+                return;
+            }
+        }
+        delayNextSearch(golem);
+    }
+
+    /** Sends the golem to the [Brew] chest to pick up {@code material} for {@code stand}. */
+    private void startAlchemyFetch(Mob golem, Block stand, String job, Material material, AlchemyScan scan) {
+        clearSearchCooldown(golem);
+        setJobFurnace(golem, stand.getLocation());
+        setJobMaterial(golem, material);
+        golem.getPersistentDataContainer().set(alchemyJobKey, PersistentDataType.STRING, job);
+        setTarget(golem, scan.brewChest.getLocation());
+        setAlchemistState(golem, "ALCHEMIST_FETCH");
+    }
+
+    private void onReachBrewChest(Mob golem, Block block) {
+        Material want = getJobMaterial(golem);
+        Location stand = getJobFurnace(golem);
+        String job = golem.getPersistentDataContainer()
+                .getOrDefault(alchemyJobKey, PersistentDataType.STRING, JOB_INGREDIENT);
+        // Grinding restocks the chest itself, so it's the one job with no stand attached.
+        if (want == null || !(block.getState() instanceof Container chest)
+                || (stand == null && !JOB_GRIND.equals(job))) {
+            abortAlchemy(golem);
+            return;
+        }
+        // Potions never stack, so everything here is carried one at a time.
+        ItemStack taken;
+        if (JOB_POTION_BASE.equals(job)) {
+            // Re-check the stand's stage on arrival — it may have moved on while we walked over.
+            ItemStack pick = findAdvanceable(golem, chest, standStageAt(stand));
+            if (pick == null) { abortAlchemy(golem); return; }
+            Material pm = pick.getType();
+            org.bukkit.potion.PotionType pt = basePotionType(pick);
+            taken = takeOne(chest, s -> s.getType() == pm && basePotionType(s) == pt);
+        } else if (want == Material.POTION) {
+            taken = takeOne(chest, this::isWaterBottle);
+        } else {
+            taken = takeOne(chest, s -> s.getType() == want);
+        }
+        if (taken == null) { abortAlchemy(golem); return; }
+
+        golem.getEquipment().setItemInMainHand(taken);
+        AlchemyScan scan = scanAlchemyStation(golem, golem.getLocation());
+        if (want == Material.GLASS_BOTTLE) {
+            if (scan.water == null) { abortAlchemy(golem); return; }
+            setTarget(golem, scan.water.getLocation());
+            setAlchemistState(golem, "ALCHEMIST_TO_WATER");
+        } else if (want == Material.BLAZE_ROD) {
+            if (scan.craftingTable == null) { abortAlchemy(golem); return; }
+            setTarget(golem, scan.craftingTable.getLocation());
+            setAlchemistState(golem, "ALCHEMIST_TO_CRAFT");
+        } else {
+            setTarget(golem, stand);
+            setAlchemistState(golem, "ALCHEMIST_TO_STAND");
+        }
+    }
+
+    /** Fills the carried glass bottle at a water source or cauldron (draining the cauldron a level). */
+    private void onReachWater(Mob golem, Block block) {
+        ItemStack hand = golem.getEquipment().getItemInMainHand();
+        Location stand = getJobFurnace(golem);
+        if (hand == null || hand.getType() != Material.GLASS_BOTTLE || stand == null) {
+            abortAlchemy(golem);
+            return;
+        }
+        if (!drawWater(block)) { // cauldron ran dry between deciding and arriving
+            setAlchemistState(golem, "ALCHEMIST_IDLE");
+            return;
+        }
+        golem.getEquipment().setItemInMainHand(waterBottle());
+        setTarget(golem, stand);
+        setAlchemistState(golem, "ALCHEMIST_TO_STAND");
+    }
+
+    /** Grinds carried blaze rods into powder using the REAL vanilla recipe via the crafting engine,
+     *  so the plugin never hardcodes "1 rod = 2 powder" and follows any future recipe change. */
+    private void onReachCraftingTable(Mob golem, Block block) {
+        ItemStack hand = golem.getEquipment().getItemInMainHand();
+        if (hand == null || hand.getType() != Material.BLAZE_ROD) {
+            abortAlchemy(golem);
+            return;
+        }
+        ItemStack[] matrix = new ItemStack[9];
+        matrix[0] = new ItemStack(Material.BLAZE_ROD, 1);
+        ItemStack result = Bukkit.craftItem(matrix, block.getWorld());
+        if (result == null || result.getType() == Material.AIR) {
+            // Recipe missing or disabled by another plugin. Say so once rather than have the golem
+            // look mysteriously idle — and keep the rod instead of silently eating it.
+            plugin.getLogger().warning("[LG] Alchemist could not grind a blaze rod: no crafting"
+                    + " recipe for blaze powder is available on this server.");
+            abortAlchemy(golem);
+            return;
+        }
+        golem.getEquipment().setItemInMainHand(result);
+        // Powder goes back to [Brew]; the IDLE safety net files non-potions there, and the normal
+        // fuel/ingredient jobs pick it up from the chest on the next pass.
+        clearAlchemyJob(golem);
+        setAlchemistState(golem, "ALCHEMIST_IDLE");
+    }
+
+    /** Puts the carried item into the stand's fuel / bottle / ingredient slot. */
+    private void onReachStandLoad(Mob golem, Block block) {
+        ItemStack hand = golem.getEquipment().getItemInMainHand();
+        if (hand == null || hand.getType() == Material.AIR) { abortAlchemy(golem); return; }
+        if (!(block.getState() instanceof org.bukkit.block.BrewingStand stand)) {
+            setAlchemistState(golem, "ALCHEMIST_IDLE"); // stand gone; safety net re-homes the item
+            return;
+        }
+        var inv = stand.getInventory();
+        String job = golem.getPersistentDataContainer()
+                .getOrDefault(alchemyJobKey, PersistentDataType.STRING, JOB_INGREDIENT);
+
+        boolean placed = false;
+        switch (job) {
+            case JOB_FUEL -> {
+                ItemStack fuel = inv.getFuel();
+                if (fuel == null || fuel.getType() == Material.AIR) {
+                    ItemStack one = hand.clone();
+                    one.setAmount(1);
+                    inv.setFuel(one);
+                    hand.setAmount(hand.getAmount() - 1);
+                    placed = true;
+                }
+            }
+            case JOB_BOTTLE, JOB_POTION_BASE -> {
+                int slot = freeBottleSlot(inv);
+                if (slot >= 0) {
+                    ItemStack one = hand.clone();
+                    one.setAmount(1);
+                    inv.setItem(slot, one);
+                    hand.setAmount(hand.getAmount() - 1);
+                    placed = true;
+                }
+            }
+            default -> {
+                ItemStack ing = inv.getIngredient();
+                if (ing == null || ing.getType() == Material.AIR) {
+                    ItemStack one = hand.clone();
+                    one.setAmount(1);
+                    inv.setIngredient(one);
+                    hand.setAmount(hand.getAmount() - 1);
+                    placed = true;
+                }
+            }
+        }
+        // Keep whatever we couldn't place in hand — the IDLE safety net delivers it rather than
+        // letting the next job's setItemInMainHand destroy it.
+        golem.getEquipment().setItemInMainHand(
+                placed && hand.getAmount() <= 0 ? new ItemStack(Material.AIR) : hand);
+        clearAlchemyJob(golem);
+        setAlchemistState(golem, "ALCHEMIST_IDLE");
+    }
+
+    /** Takes one finished potion out of the stand; the IDLE safety net walks it to [Output]. */
+    private void onReachStandCollect(Mob golem, Block block) {
+        if (!(block.getState() instanceof org.bukkit.block.BrewingStand stand)) {
+            abortAlchemy(golem);
+            return;
+        }
+        Block brewBlock = findTaggedContainer(golem.getLocation(),
+                plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BREW), false);
+        Container brew = brewBlock != null && brewBlock.getState() instanceof Container c ? c : null;
+        var inv = stand.getInventory();
+        int slot = collectableBottleSlot(golem, inv, brew);
+        if (slot < 0) { abortAlchemy(golem); return; }
+
+        ItemStack potion = inv.getItem(slot);
+        inv.setItem(slot, null);
+        golem.getEquipment().setItemInMainHand(potion);
+        clearAlchemyJob(golem);
+
+        Block out = findTaggedContainer(golem.getLocation(),
+                plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT), false);
+        if (out == null) { setAlchemistState(golem, "ALCHEMIST_IDLE"); return; }
+        setTarget(golem, out.getLocation());
+        setAlchemistState(golem, "ALCHEMIST_TO_OUTPUT");
+    }
+
+    private void onReachAlchemyOutput(Mob golem, Block block) {
+        ItemStack hand = golem.getEquipment().getItemInMainHand();
+        if (hand == null || hand.getType() == Material.AIR) {
+            setAlchemistState(golem, "ALCHEMIST_IDLE");
+            return;
+        }
+        if (!(block.getState() instanceof Container chest)) {
+            setAlchemistState(golem, "ALCHEMIST_IDLE");
+            return;
+        }
+        Map<Integer, ItemStack> leftover = chest.getInventory().addItem(hand);
+        if (leftover.isEmpty()) {
+            if (isPotionItem(hand.getType()) && !isWaterBottle(hand)) {
+                var pdc = golem.getPersistentDataContainer();
+                pdc.set(plugin.potionsBrewedKey, PersistentDataType.INTEGER,
+                        pdc.getOrDefault(plugin.potionsBrewedKey, PersistentDataType.INTEGER, 0) + 1);
+            }
+            golem.getEquipment().setItemInMainHand(new ItemStack(Material.AIR));
+            setAlchemistState(golem, "ALCHEMIST_IDLE");
+        } else {
+            // Chest filled up: keep holding it and retry, rather than dropping it on the floor.
+            golem.getEquipment().setItemInMainHand(leftover.values().iterator().next());
+            delayNextSearch(golem);
+            setAlchemistState(golem, "ALCHEMIST_IDLE");
+        }
+    }
+
+    /**
+     * Which ingredient this stand wants next, or null if nothing applies. Staged deliberately so the
+     * golem never needs the (unreadable) recipe graph and never mixes a dud: water only ever takes
+     * nether wart, an awkward base only ever takes an effect ingredient, and a finished potion takes
+     * at most ONE modifier before being collected.
+     */
+    private Material neededIngredient(Mob golem, org.bukkit.inventory.BrewerInventory inv, Container brew) {
+        java.util.Set<Material> want = null;
+        for (int i = 0; i <= 2; i++) {
+            ItemStack b = inv.getItem(i);
+            if (b == null || b.getType() == Material.AIR) continue;
+            if (!isPotionItem(b.getType())) continue;
+            org.bukkit.potion.PotionType t = basePotionType(b);
+            if (t == null) continue;
+            // Awkward is only ever a means to an end, so it isn't a switch of its own: if no target
+            // potion is achievable, don't take water down the first step either.
+            if (t == org.bukkit.potion.PotionType.WATER) {
+                if (!canBrewTarget(golem, brew)) return null;
+                want = BREW_BASE;
+            }
+            else if (t == org.bukkit.potion.PotionType.AWKWARD) want = BREW_EFFECTS;
+            // Only the modifiers vanilla would really brew into THIS potion, so we never park a
+            // dud in the ingredient slot (e.g. redstone on Healing, which has no long form).
+            else if (isBrewedPotion(b, t)) want = modifiersFor(b, t);
+            else continue; // junk (mundane/thick) — nothing more to add
+            break; // all bottles in a stand brew together, so the first one decides
+        }
+        if (want == null) return null;
+        return pickIngredient(golem, want, brew);
+    }
+
+    /**
+     * Whether any target potion is achievable right now: a switched-on effect ingredient AND the base
+     * to build it on are both in the chest. Guards the first step, so switching every potion off
+     * really stops the golem rather than leaving it churning out awkward bases nobody asked for.
+     */
+    private boolean canBrewTarget(Mob golem, Container brew) {
+        return pickIngredient(golem, BREW_EFFECTS, brew) != null
+                && pickIngredient(golem, BREW_BASE, brew) != null;
+    }
+
+    /**
+     * The ingredient from {@code want} this golem should use: the MOST ABUNDANT one present in the
+     * chest and still switched on in its menu, or null if there's nothing it may use. Most-abundant
+     * (as the smelter does with ore) rather than first-slot-found, so the choice doesn't look random
+     * to a player who keeps several ingredients in the chest.
+     */
+    private Material pickIngredient(Mob golem, java.util.Set<Material> want, Container brew) {
+        Material best = null;
+        int bestCount = 0;
+        for (ItemStack st : brew.getInventory().getContents()) {
+            if (st == null || st.getType() == Material.AIR) continue;
+            Material m = st.getType();
+            if (!want.contains(m)) continue;
+            if (!alchemyAllows(golem, m)) continue; // switched off in this golem's menu
+            int c = 0;
+            for (ItemStack s2 : brew.getInventory().getContents()) {
+                if (s2 != null && s2.getType() == m) c += s2.getAmount();
+            }
+            if (c > bestCount) { bestCount = c; best = m; }
+        }
+        return best;
+    }
+
+    /** A bottle slot holding something we're done with: a real potion (or junk), when the [Brew]
+     *  chest has nothing further to add to it. Water bottles are left alone — they're mid-recipe. */
+    private int collectableBottleSlot(Mob golem, org.bukkit.inventory.BrewerInventory inv, Container brew) {
+        if (brew != null && neededIngredient(golem, inv, brew) != null) return -1; // still has a stage to go
+        for (int i = 0; i <= 2; i++) {
+            ItemStack b = inv.getItem(i);
+            if (b == null || b.getType() == Material.AIR) continue;
+            if (!isPotionItem(b.getType())) continue;
+            if (isWaterBottle(b)) continue;
+            // An awkward base is half-finished work, never a product. Leave it in the stand until an
+            // effect ingredient turns up, instead of filing it in [Output] as though it were done.
+            if (basePotionType(b) == org.bukkit.potion.PotionType.AWKWARD) continue;
+            return i;
+        }
+        return -1;
+    }
+
+    /** The brewing stage the stand's bottles are at, or null if it holds none. All three bottles
+     *  brew together, so the first one speaks for the batch. */
+    private org.bukkit.potion.PotionType standStage(org.bukkit.inventory.BrewerInventory inv) {
+        for (int i = 0; i <= 2; i++) {
+            ItemStack b = inv.getItem(i);
+            if (b == null || b.getType() == Material.AIR) continue;
+            if (!isPotionItem(b.getType())) continue;
+            return basePotionType(b);
+        }
+        return null;
+    }
+
+    /** The stage of the stand at {@code loc}, or null if it's gone or empty. */
+    private org.bukkit.potion.PotionType standStageAt(Location loc) {
+        if (loc == null) return null;
+        return loc.getBlock().getState() instanceof org.bukkit.block.BrewingStand s
+                ? standStage(s.getInventory()) : null;
+    }
+
+    /** A potion in [Brew] the golem could take one stage further right now, or null. When
+     *  {@code stage} is set, only a potion matching the stand's current batch qualifies. */
+    private ItemStack findAdvanceable(Mob golem, Container brew, org.bukkit.potion.PotionType stage) {
+        for (ItemStack st : brew.getInventory().getContents()) {
+            if (st == null || st.getType() == Material.AIR) continue;
+            if (!isPotionItem(st.getType())) continue;
+            if (isWaterBottle(st)) continue; // water is handled by the normal fresh-batch path
+            org.bukkit.potion.PotionType t = basePotionType(st);
+            if (t == null) continue;
+            if (stage != null && t != stage) continue;
+            if (!canAdvance(golem, st, t, brew)) continue;
+            return st;
+        }
+        return null;
+    }
+
+    /** Whether an allowed ingredient exists to move this potion on: an effect for an awkward base,
+     *  a modifier for a finished one. */
+    private boolean canAdvance(Mob golem, ItemStack st, org.bukkit.potion.PotionType t, Container brew) {
+        if (t == org.bukkit.potion.PotionType.AWKWARD) {
+            return pickIngredient(golem, BREW_EFFECTS, brew) != null;
+        }
+        if (isBrewedPotion(st, t)) return pickIngredient(golem, modifiersFor(st, t), brew) != null;
+        return false;
+    }
+
+    /** Wholly empty slots — the only ones a non-stacking item like a potion can go into. */
+    private int emptySlots(Container container) {
+        Inventory inv = container.getInventory();
+        int n = 0;
+        for (int i = 0; i < inv.getSize(); i++) {
+            ItemStack s = inv.getItem(i);
+            if (s == null || s.getType() == Material.AIR) n++;
+        }
+        return n;
+    }
+
+    /** Bottles occupying this stand — each will want a slot in [Output] once it's brewed. */
+    private int countBottles(org.bukkit.inventory.BrewerInventory inv) {
+        int n = 0;
+        for (int i = 0; i <= 2; i++) {
+            ItemStack b = inv.getItem(i);
+            if (b != null && b.getType() != Material.AIR) n++;
+        }
+        return n;
+    }
+
+    private boolean standHasBottles(org.bukkit.inventory.BrewerInventory inv) {
+        for (int i = 0; i <= 2; i++) {
+            ItemStack b = inv.getItem(i);
+            if (b != null && b.getType() != Material.AIR) return true;
+        }
+        return false;
+    }
+
+    private int freeBottleSlot(org.bukkit.inventory.BrewerInventory inv) {
+        for (int i = 0; i <= 2; i++) {
+            ItemStack b = inv.getItem(i);
+            if (b == null || b.getType() == Material.AIR) return i;
+        }
+        return -1;
+    }
+
+    private org.bukkit.potion.PotionType basePotionType(ItemStack stack) {
+        return stack.getItemMeta() instanceof org.bukkit.inventory.meta.PotionMeta pm
+                && pm.hasBasePotionType() ? pm.getBasePotionType() : null;
+    }
+
+    /** An actual effect potion — not water, not the awkward base, not mundane/thick junk. */
+    private boolean isBrewedPotion(ItemStack stack, org.bukkit.potion.PotionType t) {
+        if (!isPotionItem(stack.getType())) return false;
+        return t != org.bukkit.potion.PotionType.WATER
+                && t != org.bukkit.potion.PotionType.AWKWARD
+                && t != org.bukkit.potion.PotionType.MUNDANE
+                && t != org.bukkit.potion.PotionType.THICK;
+    }
+
+    /** Base potions a fermented spider eye corrupts into something else. Can't be derived from the
+     *  enum (the mapping is arbitrary), so it's listed — conservatively, plain forms only. */
+    private static final java.util.Set<org.bukkit.potion.PotionType> CORRUPTIBLE = java.util.Set.of(
+            org.bukkit.potion.PotionType.NIGHT_VISION, org.bukkit.potion.PotionType.SWIFTNESS,
+            org.bukkit.potion.PotionType.LEAPING, org.bukkit.potion.PotionType.HEALING,
+            org.bukkit.potion.PotionType.POISON);
+
+    private boolean potionTypeExists(String name) {
+        try {
+            return org.bukkit.potion.PotionType.valueOf(name) != null;
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Whether vanilla would actually brew {@code mod} into this potion. Derived from PotionType
+     * itself — LONG_STRENGTH exists but LONG_HEALING doesn't, so redstone fits Strength and not
+     * Healing. This matters: an ingredient vanilla won't brew just sits in the slot, and a stand
+     * with an occupied ingredient slot is one the golem leaves alone — i.e. stuck for good.
+     */
+    private boolean modifierApplies(ItemStack stack, org.bukkit.potion.PotionType t, Material mod) {
+        Material m = stack.getType();
+        return switch (mod) {
+            case REDSTONE -> potionTypeExists("LONG_" + t.name());
+            case GLOWSTONE_DUST -> potionTypeExists("STRONG_" + t.name());
+            case GUNPOWDER -> m == Material.POTION;             // a drinkable potion becomes splash
+            case DRAGON_BREATH -> m == Material.SPLASH_POTION;  // and a splash one becomes lingering
+            case FERMENTED_SPIDER_EYE -> CORRUPTIBLE.contains(t);
+            default -> false;
+        };
+    }
+
+    /** The modifiers that fit this exact potion right now. */
+    private java.util.Set<Material> modifiersFor(ItemStack stack, org.bukkit.potion.PotionType t) {
+        java.util.Set<Material> out = new java.util.HashSet<>();
+        for (Material mod : BREW_MODIFIERS) {
+            if (modifierApplies(stack, t, mod)) out.add(mod);
+        }
+        return out;
+    }
+
+    private boolean isPotionItem(Material m) {
+        return m == Material.POTION || m == Material.SPLASH_POTION || m == Material.LINGERING_POTION;
+    }
+
+    private boolean isWaterBottle(ItemStack stack) {
+        return stack != null && stack.getType() == Material.POTION
+                && basePotionType(stack) == org.bukkit.potion.PotionType.WATER;
+    }
+
+    private ItemStack waterBottle() {
+        ItemStack it = new ItemStack(Material.POTION);
+        if (it.getItemMeta() instanceof org.bukkit.inventory.meta.PotionMeta pm) {
+            pm.setBasePotionType(org.bukkit.potion.PotionType.WATER);
+            it.setItemMeta(pm);
+        }
+        return it;
+    }
+
+    private boolean containsMaterial(Container chest, Material m) {
+        for (ItemStack st : chest.getInventory().getContents()) {
+            if (st != null && st.getType() == m) return true;
+        }
+        return false;
+    }
+
+    private boolean containsWaterBottle(Container chest) {
+        for (ItemStack st : chest.getInventory().getContents()) {
+            if (isWaterBottle(st)) return true;
+        }
+        return false;
+    }
+
+    /** Removes and returns exactly one matching item — needed because potions carry meta that a
+     *  plain Material match (as the smelter uses) can't tell apart (water bottle vs finished potion). */
+    private ItemStack takeOne(Container chest, java.util.function.Predicate<ItemStack> match) {
+        Inventory inv = chest.getInventory();
+        for (int i = 0; i < inv.getSize(); i++) {
+            ItemStack st = inv.getItem(i);
+            if (st == null || st.getType() == Material.AIR) continue;
+            if (!match.test(st)) continue;
+            ItemStack one = st.clone();
+            one.setAmount(1);
+            st.setAmount(st.getAmount() - 1);
+            inv.setItem(i, st.getAmount() <= 0 ? null : st);
+            return one;
+        }
+        return null;
+    }
+
+    /** Takes one bottle's worth of water; drains a cauldron by a level (a source block is endless). */
+    private boolean drawWater(Block block) {
+        if (block.getType() == Material.WATER_CAULDRON) {
+            if (!(block.getBlockData() instanceof org.bukkit.block.data.Levelled lv)) return false;
+            int level = lv.getLevel();
+            if (level <= 0) return false;
+            if (level == 1) {
+                block.setType(Material.CAULDRON);
+            } else {
+                lv.setLevel(level - 1);
+                block.setBlockData(lv);
+            }
+            return true;
+        }
+        return block.getType() == Material.WATER;
+    }
+
+    private boolean isWaterSource(Block b) {
+        if (b.getType() == Material.WATER_CAULDRON) {
+            return b.getBlockData() instanceof org.bukkit.block.data.Levelled lv && lv.getLevel() > 0;
+        }
+        if (b.getType() == Material.WATER) {
+            // Only a true source is endless; flowing water would vanish as the golem walks over.
+            return !(b.getBlockData() instanceof org.bukkit.block.data.Levelled lv) || lv.getLevel() == 0;
+        }
+        return false;
+    }
+
+    private static final class AlchemyScan {
+        final List<Block> stands = new ArrayList<>();
+        Block brewChest, outputChest, water, craftingTable;
+        double brewDist = Double.MAX_VALUE, outputDist = Double.MAX_VALUE,
+               waterDist = Double.MAX_VALUE, craftDist = Double.MAX_VALUE;
+    }
+
+    /** One pass over the search cube collecting every brewing stand plus the nearest [Brew]/[Output]
+     *  container, water source and crafting table. */
+    private AlchemyScan scanAlchemyStation(Mob golem, Location origin) {
+        World world = origin.getWorld();
+        int ox = origin.getBlockX(), oy = origin.getBlockY(), oz = origin.getBlockZ();
+        int r = plugin.cfg.searchRadius;
+        String brewTag   = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BREW);
+        String outputTag = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT);
+        AlchemyScan scan = new AlchemyScan();
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
+                    Material t = b.getType();
+                    double d = b.getLocation().distanceSquared(origin);
+                    if (t == Material.BREWING_STAND) { scan.stands.add(b); continue; }
+                    if (t == Material.CRAFTING_TABLE) {
+                        if (d < scan.craftDist) { scan.craftDist = d; scan.craftingTable = b; }
+                        continue;
+                    }
+                    if (isWaterSource(b)) {
+                        if (d < scan.waterDist) { scan.waterDist = d; scan.water = b; }
+                        continue;
+                    }
+                    if (!isStorageMaterial(t)) continue;
+                    if (containerHasTag(b, brewTag)) {
+                        if (d < scan.brewDist) { scan.brewDist = d; scan.brewChest = b; }
+                    } else if (containerHasTag(b, outputTag)) {
+                        if (d < scan.outputDist) { scan.outputDist = d; scan.outputChest = b; }
+                    }
+                }
+            }
+        }
+        return scan;
+    }
+
+    private void moveToTargetAlchemist(Mob golem, ReachCallback onReach) {
+        Location target = getTarget(golem);
+        if (target == null) {
+            clearSearchCooldown(golem);
+            setAlchemistState(golem, "ALCHEMIST_IDLE");
+            return;
+        }
+        // Centre-based reach (as for the courier): stands and containers are solid blocks the golem
+        // can never stand on, so corner-distance would read short of a golem standing right at them.
+        if (reachDist(golem.getLocation(), target) <= plugin.cfg.reachDistance) {
+            Block block = target.getBlock();
+            clearTarget(golem);
+            onReach.onReach(golem, block);
+        } else {
+            golem.getPathfinder().moveTo(target, 1.0);
+        }
+    }
+
+    private void setAlchemistState(Mob golem, String state) {
+        golem.getPersistentDataContainer().set(stateKey, PersistentDataType.STRING, state);
+    }
+
+    private void clearAlchemyJob(Mob golem) {
+        clearJobFurnace(golem);
+        golem.getPersistentDataContainer().remove(alchemyJobKey);
+    }
+
+    private void abortAlchemy(Mob golem) {
+        clearAlchemyJob(golem);
+        clearTarget(golem);
+        delayNextSearch(golem);
+        setAlchemistState(golem, "ALCHEMIST_IDLE");
     }
 
     // ===== COURIER =====
@@ -1353,12 +2184,17 @@ public class GolemTicker extends BukkitRunnable {
      * Scans the search cube around {@code origin} ONCE, collecting every furnace and the
      * nearest [Smelt]/[Fuel]/[Output] chest — replacing four separate cube passes.
      */
-    private StationScan scanStation(Location origin) {
+    private StationScan scanStation(Mob golem, Location origin) {
         World world = origin.getWorld();
         int ox = origin.getBlockX();
         int oy = origin.getBlockY();
         int oz = origin.getBlockZ();
         int r = plugin.cfg.searchRadius;
+
+        // Resolve THIS golem's tags once: they may be its own overrides rather than the config's.
+        String smeltTag  = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.SMELT);
+        String fuelTag   = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.FUEL);
+        String outputTag = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT);
 
         StationScan scan = new StationScan();
         for (int dx = -r; dx <= r; dx++) {
@@ -1372,14 +2208,12 @@ public class GolemTicker extends BukkitRunnable {
                     }
                     if (!isStorageMaterial(t)) continue;
 
-                    String matched = matchedContainerTag(b);
-                    if (matched == null) continue;
                     double d = b.getLocation().distanceSquared(origin);
-                    if (matched.equals(plugin.cfg.smeltSignText)) {
+                    if (containerHasTag(b, smeltTag)) {
                         if (d < scan.smeltDist)  { scan.smeltDist = d;  scan.smeltChest = b; }
-                    } else if (matched.equals(plugin.cfg.fuelSignText)) {
+                    } else if (containerHasTag(b, fuelTag)) {
                         if (d < scan.fuelDist)   { scan.fuelDist = d;   scan.fuelChest = b; }
-                    } else if (matched.equals(plugin.cfg.outputSignText)) {
+                    } else if (containerHasTag(b, outputTag)) {
                         if (d < scan.outputDist) { scan.outputDist = d; scan.outputChest = b; }
                     }
                 }
@@ -1432,26 +2266,6 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     /** Returns which smelter tag (smelt/fuel/output) marks this container — by name or sign — or null. */
-    private String matchedContainerTag(Block b) {
-        if (!isStorageMaterial(b.getType())) return null;
-        if (b.getState() instanceof Container container) {
-            var name = container.customName();
-            if (name != null) {
-                String plain = PlainTextComponentSerializer.plainText().serialize(name);
-                if (plain.equalsIgnoreCase(plugin.cfg.smeltSignText))  return plugin.cfg.smeltSignText;
-                if (plain.equalsIgnoreCase(plugin.cfg.fuelSignText))   return plugin.cfg.fuelSignText;
-                if (plain.equalsIgnoreCase(plugin.cfg.outputSignText)) return plugin.cfg.outputSignText;
-            }
-            for (BlockFace face : SIGN_FACES) {
-                if (!(b.getRelative(face).getState() instanceof Sign sign)) continue;
-                if (signMatches(sign, plugin.cfg.smeltSignText))  return plugin.cfg.smeltSignText;
-                if (signMatches(sign, plugin.cfg.fuelSignText))   return plugin.cfg.fuelSignText;
-                if (signMatches(sign, plugin.cfg.outputSignText)) return plugin.cfg.outputSignText;
-            }
-        }
-        return null;
-    }
-
     private boolean isContainerFull(Container container) {
         Inventory inv = container.getInventory();
         for (int i = 0; i < inv.getSize(); i++) {
@@ -1529,7 +2343,7 @@ public class GolemTicker extends BukkitRunnable {
         }
         if (!canSearch(golem)) return;
         Block target = findTaggedContainer(golem.getLocation(),
-                plugin.cfg.bucketSignText, true);
+                plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BUCKETS), true);
         if (target == null) { delayNextSearch(golem); return; }
         clearSearchCooldown(golem);
         setTarget(golem, target.getLocation());
@@ -1548,7 +2362,7 @@ public class GolemTicker extends BukkitRunnable {
     private void seekLavaChest(Mob golem) {
         if (!canSearch(golem)) return;
         Block target = findTaggedContainer(golem.getLocation(),
-                plugin.cfg.lavaSignText, false);
+                plugin.tagFor(golem, LavaGolemPlugin.GolemTag.LAVA), false);
         if (target == null) { delayNextSearch(golem); return; }
         clearSearchCooldown(golem);
         setTarget(golem, target.getLocation());

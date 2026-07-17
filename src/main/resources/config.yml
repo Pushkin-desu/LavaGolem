@@ -29,8 +29,16 @@ smelt-sign-text: "[Smelt]"
 # Containers holding fuel for furnaces (Smelter golem)
 fuel-sign-text: "[Fuel]"
 
-# Containers where smelted output (and spent buckets) are delivered (Smelter golem)
+# Containers where smelted output (and spent buckets) are delivered (Smelter golem).
+# The Alchemist delivers finished potions here too.
 output-sign-text: "[Output]"
+
+# --- Alchemist golem ---
+# One container holds EVERYTHING the alchemist needs: glass bottles, nether wart, blaze powder
+# or blaze rods, and any brewing ingredients. It sorts the contents out by itself.
+# It also needs brewing stands, a water source or water cauldron to fill bottles at, and a
+# crafting table (only if you give it blaze rods instead of powder).
+brew-sign-text: "[Brew]"
 
 # --- Courier golem ---
 # The courier carries items between tagged containers along routes you set in its GUI.

@@ -39,13 +39,60 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public NamespacedKey bucketsTakenKey;
     public NamespacedKey itemsSmeltedKey;
     public NamespacedKey itemsMovedKey;
+    public NamespacedKey potionsBrewedKey;
     public NamespacedKey courierRoutesKey;
     public NamespacedKey createdAtKey;
+    /** Set when a player has paused this golem from its menu; the ticker then leaves it alone. */
+    public NamespacedKey pausedKey;
+    /** Ingredients the alchemist is told NOT to use (absent = brew everything in the chest). */
+    public NamespacedKey alchemyDisabledKey;
+
+    /**
+     * The station tags a golem looks for. The config value is only the DEFAULT — each golem can be
+     * given its own tag from its menu, so two stations of the same kind can sit side by side without
+     * fighting over one shared `[Output]`.
+     */
+    public enum GolemTag { BUCKETS, LAVA, SMELT, FUEL, OUTPUT, BREW }
+
+    private final Map<GolemTag, NamespacedKey> tagKeys = new java.util.EnumMap<>(GolemTag.class);
+
+    /** The config default for a tag (what a golem uses unless it was given its own). */
+    public String defaultTag(GolemTag t) {
+        return switch (t) {
+            case BUCKETS -> cfg.bucketSignText;
+            case LAVA -> cfg.lavaSignText;
+            case SMELT -> cfg.smeltSignText;
+            case FUEL -> cfg.fuelSignText;
+            case OUTPUT -> cfg.outputSignText;
+            case BREW -> cfg.brewSignText;
+        };
+    }
+
+    /** The tag THIS golem looks for: its own override, else the config default. */
+    public String tagFor(org.bukkit.entity.Mob golem, GolemTag t) {
+        String v = golem.getPersistentDataContainer().get(tagKeys.get(t), PersistentDataType.STRING);
+        return (v == null || v.isEmpty()) ? defaultTag(t) : v;
+    }
+
+    public boolean hasTagOverride(org.bukkit.entity.Mob golem, GolemTag t) {
+        String v = golem.getPersistentDataContainer().get(tagKeys.get(t), PersistentDataType.STRING);
+        return v != null && !v.isEmpty();
+    }
+
+    /** Sets a golem's own tag; null/blank clears it back to the config default. */
+    public void setTag(org.bukkit.entity.Mob golem, GolemTag t, String value) {
+        if (value == null || value.isBlank()) {
+            golem.getPersistentDataContainer().remove(tagKeys.get(t));
+        } else {
+            golem.getPersistentDataContainer().set(tagKeys.get(t), PersistentDataType.STRING, value.trim());
+        }
+    }
 
     /** Golem roles. */
     public static final String ROLE_HAULER = "LAVA_HAULER";
     public static final String ROLE_SMELTER = "SMELTER";
     public static final String ROLE_COURIER = "COURIER";
+    public static final String ROLE_ALCHEMIST = "ALCHEMIST";
 
     /** Smelter work modes (configurable per-golem via its GUI). */
     public static final String MODE_BALANCED = "BALANCED";
@@ -65,6 +112,8 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public Messages msg;
     public GolemMenu golemMenu;
     public CourierMenu courierMenu;
+    public AlchemistMenu alchemistMenu;
+    public TagPrompt tagPrompt;
     public GolemTicker golemTicker;
 
     /** Golems whose settings menu is currently open. The ticker holds any such golem still, whatever
@@ -81,6 +130,22 @@ public final class LavaGolemPlugin extends JavaPlugin {
 
     public boolean isMenuOpen(java.util.UUID golemId) { return openMenus.contains(golemId); }
 
+    /** Whether a player has parked this golem via its menu's power button. Unlike a menu being open
+     *  (which holds it only while you look at it), a pause persists until you switch it back on. */
+    public boolean isPaused(org.bukkit.entity.Mob golem) {
+        return golem.getPersistentDataContainer()
+                .getOrDefault(pausedKey, PersistentDataType.BYTE, (byte) 0) == (byte) 1;
+    }
+
+    public void setPaused(org.bukkit.entity.Mob golem, boolean paused) {
+        if (paused) {
+            golem.getPersistentDataContainer().set(pausedKey, PersistentDataType.BYTE, (byte) 1);
+            golem.getPathfinder().stopPathfinding(); // stop mid-stride rather than coasting on
+        } else {
+            golem.getPersistentDataContainer().remove(pausedKey);
+        }
+    }
+
     @Override
     public void onEnable() {
         cfg = new PluginConfig(this);
@@ -95,6 +160,12 @@ public final class LavaGolemPlugin extends JavaPlugin {
         bucketsTakenKey  = new NamespacedKey(this, "buckets_taken");
         itemsSmeltedKey  = new NamespacedKey(this, "items_smelted");
         itemsMovedKey    = new NamespacedKey(this, "items_moved");
+        potionsBrewedKey = new NamespacedKey(this, "potions_brewed");
+        pausedKey        = new NamespacedKey(this, "paused");
+        alchemyDisabledKey = new NamespacedKey(this, "alchemy_disabled");
+        for (GolemTag t : GolemTag.values()) {
+            tagKeys.put(t, new NamespacedKey(this, "tag_" + t.name().toLowerCase()));
+        }
         courierRoutesKey = new NamespacedKey(this, "courier_routes");
         createdAtKey     = new NamespacedKey(this, "created_at");
 
@@ -106,11 +177,16 @@ public final class LavaGolemPlugin extends JavaPlugin {
         registerHeartRecipe();
         registerSmelterHeartRecipe();
         registerCourierHeartRecipe();
+        registerAlchemistHeartRecipe();
         golemMenu = new GolemMenu(this);
         courierMenu = new CourierMenu(this);
+        alchemistMenu = new AlchemistMenu(this);
+        tagPrompt = new TagPrompt(this);
         getServer().getPluginManager().registerEvents(new HeartUseListener(this), this);
         getServer().getPluginManager().registerEvents(golemMenu, this);
         getServer().getPluginManager().registerEvents(courierMenu, this);
+        getServer().getPluginManager().registerEvents(alchemistMenu, this);
+        getServer().getPluginManager().registerEvents(tagPrompt, this);
 
         getCommand("removegolems").setExecutor((sender, command, label, args) -> {
             int count = 0;
@@ -251,6 +327,7 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public ItemStack createGolemHeart(String role) {
         String prefix = ROLE_SMELTER.equals(role) ? "smelter-heart"
                 : ROLE_COURIER.equals(role) ? "courier-heart"
+                : ROLE_ALCHEMIST.equals(role) ? "alchemist-heart"
                 : "heart";
         ItemStack item = new ItemStack(Material.COPPER_GOLEM_SPAWN_EGG);
         ItemMeta meta = item.getItemMeta();
@@ -304,6 +381,19 @@ public final class LavaGolemPlugin extends JavaPlugin {
         recipe.setIngredient('C', Material.COPPER_INGOT);
         recipe.setIngredient('R', Material.REDSTONE);
         recipe.setIngredient('L', Material.HOPPER);
+        Bukkit.addRecipe(recipe);
+    }
+
+    private void registerAlchemistHeartRecipe() {
+        ShapedRecipe recipe = new ShapedRecipe(
+                new NamespacedKey(this, "alchemist_heart_recipe"),
+                createGolemHeart(ROLE_ALCHEMIST)
+        );
+        // Pattern: CRC / RLR / CRC (copper corners, redstone cross, brewing stand center)
+        recipe.shape("CRC", "RLR", "CRC");
+        recipe.setIngredient('C', Material.COPPER_INGOT);
+        recipe.setIngredient('R', Material.REDSTONE);
+        recipe.setIngredient('L', Material.BREWING_STAND);
         Bukkit.addRecipe(recipe);
     }
 }

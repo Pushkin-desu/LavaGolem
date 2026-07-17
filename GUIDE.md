@@ -10,6 +10,7 @@ Everything about setting the golems up, and what to do when a courier won't move
 - [Common rules](#common-rules)
 - [🪣 Lava Golem](#-lava-golem)
 - [🔥 Smelter Golem](#-smelter-golem)
+- [⚗️ Alchemist Golem](#️-alchemist-golem)
 - [📦 Courier Golem](#-courier-golem)
 - [How the courier finds its way](#how-the-courier-finds-its-way)
 - [Troubleshooting: the courier won't move](#troubleshooting-the-courier-wont-move)
@@ -21,12 +22,19 @@ Everything about setting the golems up, and what to do when a courier won't move
 
 These apply to all three golems.
 
+- **Telling them apart.** The **Lava Golem is on fire** (purely visual — it takes no damage) and the **Alchemist trails magic particles**. The Smelter and Courier are plain; the Courier is the one visibly carrying an item. No resource pack is involved.
 - **Spawning.** Craft the golem's Heart (recipes below), then right-click the ground with it. Only golems made from these recipes are controlled — vanilla copper golems are left alone.
 - **Menu.** Right-click a golem with an **empty hand** to open its menu (stats, and settings where it has them).
+- **Switching one off.** Every menu has a **power button**: click it and the golem stops on the spot and stays parked until you switch it back on. Handy while you rebuild a station. The setting survives restarts.
 - **Disassemble.** **Sneak + right-click** with an empty hand. The Heart drops back, along with whatever the golem was carrying.
 - **Tagging a container.** Storage can be a **chest, trapped chest, barrel or shulker box**. Tag it either by:
   - putting a **sign** with the tag text on any of its 6 faces, **or**
   - **renaming the container itself** in an anvil to that text (no sign — cleaner build).
+- **Each golem can use its own tags.** The tags in the config are just the **defaults**. Every station menu shows the containers that golem looks for: **right-click** one to type any tag you like, **left-click** to reset it to the default. So two breweries — or a brewery and a smeltery — can sit next to each other without fighting over one shared `[Output]`: give one of them `[Potions]` and you're done. A custom tag is marked in blue and survives restarts.
+- **How a tag is matched.** The golem compares the tag against the container's **whole** name or sign line, ignoring case. So:
+  - **The brackets are not syntax** — they're just how the default tags happen to be written. If your chest is named `Potions`, the tag is `Potions`. If it's named `[Potions]`, the tag is `[Potions]`, brackets included. Typing `output` will **not** match a chest named `[Output]`.
+  - **Any language works** — `Кладовка`, `Tränke`, `倉庫` are all fine, on a sign, in an anvil and in the chat prompt. Case is ignored there too.
+  - Watch out for a stray **trailing space** in a container's name: it's invisible in-game but makes the tag not match.
 - **Range.** Golems look for their containers within `search-radius` (default 8 blocks) of where they currently stand. The courier is the exception — it has its own, larger `courier-search-radius`.
 - **Restarts.** A golem's role, current job, work mode and courier routes are all saved and restored when its chunk loads.
 
@@ -71,6 +79,56 @@ These apply to all three golems.
 - **Collect only** — only hauls finished goods out.
 
 Run one Smelter on **Load only** and another on **Collect only** if you want them split.
+
+---
+
+## ⚗️ Alchemist Golem
+
+**Recipe center:** Brewing Stand · **Works with:** brewing stands + one `[Brew]` container, water, and an `[Output]` container.
+
+**What it does:** runs your brewing stands — fills bottles at water, feeds them, adds ingredients stage by stage, and hauls the finished potions out. No hopper-and-dropper brewery needed.
+
+**One chest holds everything.** You don't sort anything: put glass bottles, nether wart, blaze powder (or blaze rods) and your ingredients into a single `[Brew]` container, and the golem works out what each item is for.
+
+**Setup:**
+1. One or more **brewing stands** in range.
+2. A `[Brew]` container with bottles, fuel and ingredients — all mixed together.
+3. **Water** in range: a water source block, or a **water cauldron** (which dripstone or rain refills — the golem drains one level per bottle).
+4. An `[Output]` container for the finished potions.
+5. *(Optional)* a **crafting table**, if you'd rather stock blaze **rods** than powder. The golem grinds a rod (using the real vanilla recipe) and puts the powder back in `[Brew]`, where its fuel and Strength jobs pick it up — so rods work for both. Like everything else, the table must be **within `search-radius`** (8 blocks by default), or the rods are simply ignored.
+
+**How it brews.** It works in stages, looking at what's already in the stand:
+
+| Bottles in the stand | What the golem adds |
+|---|---|
+| Water bottle | Nether wart → awkward base |
+| Awkward base | An effect ingredient (melon, sugar, magma cream, …) |
+| A finished potion | Any modifier that fits it (redstone, glowstone, gunpowder, dragon's breath) |
+| Anything else / nothing left to add | Nothing — it hauls them to `[Output]` |
+
+**It brews for as long as the ingredients are in the chest**, and stops exactly where they run out. Want long Strength? Stock nether wart, blaze powder and redstone. Add gunpowder as well and you'll get a splash long Strength — it keeps applying modifiers while any of them still fit.
+
+It only ever adds a modifier vanilla would really brew, worked out from the game's own potion list: redstone extends Strength (there is a long Strength) but is never added to Healing (there is no long Healing). So it can't jam a stand with an ingredient that would never brew.
+
+It only ever starts a batch it can **finish**: the awkward base is a means to an end, so with no target potion available (or all of them switched off in the menu) the golem won't touch the water either. Nether wart alone in the chest brews nothing.
+
+**It won't brew more than `[Output]` can take.** Potions don't stack, so each one needs a whole empty slot — and the golem counts them: two free slots buys two bottles, not a full batch of three. With the chest full it finishes whatever is already in a stand and then waits, rather than stranding potions it can't hand in. Clear the chest and it picks straight back up.
+
+For the same reason an awkward base is **never carried to `[Output]`** — if you run out of the effect ingredient mid-batch, the awkward potions simply wait in the stand until you restock, instead of being filed away as if they were finished.
+
+**Potions in `[Brew]` get picked up and carried on.** Drop an awkward base (or a finished potion you want a modifier on) into the chest and the golem loads it straight into a stand, skipping the water-and-wart trip entirely. That's what makes "to brew further, drop the potion back into `[Brew]`" work.
+
+**Choosing what it may brew — the menu.** Right-click the alchemist to open a list of every potion, shown as the real potion item. Click one to switch it **on or off**. Everything is on by default, so the golem brews whatever the chest allows; switch a potion off and it will ignore that ingredient even if it's sitting in `[Brew]`. Below the potions are the modifiers (extended, stronger, splash, lingering, corrupt) — the same toggles.
+
+If several allowed ingredients are in the chest at once, it takes the **most abundant** one (the same rule the Smelter uses for ore).
+
+> Switching **Strength** off doesn't stop the golem using blaze powder as *fuel* — fuel and ingredients are separate jobs.
+
+**Blaze powder is both fuel and an ingredient**, so the golem only ever keeps **one pinch in the fuel slot** (that's already 20 brews). Everything else stays available for Strength potions.
+
+**Menu:** the potion toggles above, plus the on/off switch and stats (potions brewed, active since).
+
+> **Note on ingredients:** vanilla brewing recipes can't be read from the server API (unlike furnace recipes), so the golem's ingredient list is maintained by hand in the plugin. A brand-new vanilla ingredient may need a plugin update to be recognised.
 
 ---
 
@@ -179,7 +237,8 @@ bucket-sign-text: "[Buckets]"   # Lava Golem: empty buckets
 lava-sign-text:   "[Lava]"      # Lava Golem: filled lava buckets
 smelt-sign-text:  "[Smelt]"     # Smelter: items to melt
 fuel-sign-text:   "[Fuel]"      # Smelter: any vanilla fuel
-output-sign-text: "[Output]"    # Smelter: finished goods (+ returned buckets)
+output-sign-text: "[Output]"    # Smelter: finished goods (+ returned buckets); Alchemist: potions
+brew-sign-text:   "[Brew]"      # Alchemist: bottles + fuel + ingredients, all in one container
 
 # --- Courier only ---
 courier-search-radius: 24    # Same in every direction; must cover BOTH ends of a route. Capped at 32 (cost ~ radius^3)
