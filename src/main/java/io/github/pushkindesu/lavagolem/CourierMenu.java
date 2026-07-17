@@ -48,6 +48,7 @@ public class CourierMenu implements Listener {
 
     // Slot layout (54-slot / 6 rows).
     private static final int SLOT_PREV = 0, SLOT_ADD = 2, SLOT_INDICATOR = 4, SLOT_DELETE = 6, SLOT_NEXT = 8;
+    private static final int SLOT_POWER = 46;
     private static final int SLOT_SOURCE = 11, SLOT_DEST = 15, SLOT_MODE = 22, SLOT_STATS = 49;
     private static final int SLOT_SAVE = 53;
     private static final int SLOT_STATUS = 45;
@@ -123,6 +124,19 @@ public class CourierMenu implements Listener {
         inv.setItem(SLOT_STATS, button(Material.BOOK, "courier-stats", String.valueOf(moved)));
         inv.setItem(SLOT_SAVE, button(Material.EMERALD, "courier-save", null));
         inv.setItem(SLOT_STATUS, statusItem(golem, route));
+        inv.setItem(SLOT_POWER, powerButton(golem));
+    }
+
+    private ItemStack powerButton(Mob golem) {
+        boolean paused = plugin.isPaused(golem);
+        ItemStack item = new ItemStack(paused ? Material.RED_DYE : Material.LIME_DYE);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(Component.text(plugin.msg.get(paused ? "power-paused" : "power-working"),
+                paused ? NamedTextColor.RED : NamedTextColor.GREEN).decoration(TextDecoration.ITALIC, false));
+        meta.lore(List.of(Component.text(plugin.msg.get("power-hint"), NamedTextColor.DARK_GRAY)
+                .decoration(TextDecoration.ITALIC, false)));
+        item.setItemMeta(meta);
+        return item;
     }
 
     private ItemStack statusItem(Mob golem, CourierRoute route) {
@@ -208,6 +222,7 @@ public class CourierMenu implements Listener {
                 save(golem, routes);
             }
             case SLOT_MODE -> { route.blacklist = !route.blacklist; save(golem, routes); }
+            case SLOT_POWER -> plugin.setPaused(golem, !plugin.isPaused(golem));
             case SLOT_SAVE -> {
                 save(golem, routes); // already auto-saved, but confirm + close for clarity
                 if (event.getWhoClicked() instanceof Player p) {

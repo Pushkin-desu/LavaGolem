@@ -1,6 +1,6 @@
 # LavaGolem
 
-A Paper plugin for Minecraft 1.21 that adds three automated Copper Golems: one hauls lava from cauldrons, one keeps your furnaces running, and one carries items between your storage.
+A Paper plugin for Minecraft 1.21 that adds four automated Copper Golems: one hauls lava from cauldrons, one keeps your furnaces running, one runs your brewing stands, and one carries items between your storage.
 
 [README на русском](README_RU.md) · [Full guide & troubleshooting](GUIDE.md)
 
@@ -22,6 +22,16 @@ Feeds your furnaces and hauls out the results — no hoppers, no rails.
 - Handles **furnaces, blast furnaces and smokers**, routing automatically: ores → blast furnaces, food → smokers, everything else → furnaces.
 - Right-click it for a menu with work modes: **Balanced**, **Load only**, **Collect only**.
 
+### ⚗️ Alchemist Golem
+Runs your brewing stands — no dropper-and-hopper brewery.
+
+- **One chest for everything** — put glass bottles, nether wart, blaze powder (or rods) and ingredients into a single `[Brew]` container; the golem sorts out what each item is for.
+- **Fetches its own water** — fills bottles at a water source or a water cauldron (which rain/dripstone refills).
+- **Brews by stages** — water → nether wart → awkward → an effect ingredient → one modifier, then hauls the potions to `[Output]`. It brews for as long as the ingredients are in the chest.
+- **Pick what it may brew** — its menu lists every potion as the real potion item; click to switch each one on or off (modifiers too). All on by default; with several ingredients available it takes the most abundant.
+- **Keeps only one blaze powder as fuel** (a single pinch is 20 brews), leaving the rest available for Strength potions.
+- **Grinds blaze rods** into powder at a crafting table, using the real vanilla recipe.
+
 ### 📦 Courier Golem
 Carries items between tagged containers along routes you set in its GUI.
 
@@ -32,7 +42,7 @@ Carries items between tagged containers along routes you set in its GUI.
 
 ## Recipes
 
-All three share the same shape — only the center changes:
+All four share the same shape — only the center changes:
 
 ```
 C R C        C = Copper Ingot
@@ -44,6 +54,7 @@ C R C
 |---|---|
 | Lava Golem | Lava Bucket |
 | Smelter Golem | Furnace |
+| Alchemist Golem | Brewing Stand |
 | Courier Golem | Hopper |
 
 The result is a **Golem Heart**. Right-click the ground with it to place the golem.
@@ -60,12 +71,17 @@ Storage can be a **chest, trapped chest, barrel or shulker box**. Tag it either 
 | `[Lava]` | Lava Golem — filled lava buckets |
 | `[Smelt]` | Smelter — items to melt |
 | `[Fuel]` | Smelter — any vanilla fuel |
-| `[Output]` | Smelter — finished goods (spent buckets return here too) |
+| `[Output]` | Smelter — finished goods (spent buckets return here too); Alchemist — potions |
+| `[Brew]` | Alchemist — bottles, fuel and ingredients, all in one |
 | *anything* | Courier — routes use whatever tags you type |
+
+These are only the **defaults**. In any golem's menu, right-click a container slot to give *that golem* its own tag (left-click resets it), so two stations of the same kind can stand side by side without sharing an `[Output]`.
 
 ## Everyday use
 
+- **Telling them apart** — the Lava Golem is on fire (visual only, it takes no damage) and the Alchemist trails magic particles. No resource pack.
 - **Stats / settings** — right-click a golem with an empty hand to open its menu.
+- **Switching one off** — every menu has a power button; the golem stops where it stands until you switch it back on.
 - **Disassemble** — sneak + right-click with an empty hand; the Heart drops back along with anything the golem carried.
 - Golems, their current job, mode and routes survive server restarts.
 
@@ -90,6 +106,7 @@ lava-sign-text: "[Lava]"
 smelt-sign-text: "[Smelt]"
 fuel-sign-text: "[Fuel]"
 output-sign-text: "[Output]"
+brew-sign-text: "[Brew]"  # Alchemist: bottles + fuel + ingredients in one container
 
 courier-search-radius: 24 # Courier only: same in every direction, must cover both ends of a route (max 32)
 courier-carry-limit: 16   # Items a courier carries per trip
@@ -111,7 +128,7 @@ Requires Java 21 and Maven 3.x.
 mvn clean package
 ```
 
-The plugin jar will be at `target/lavagolem-1.0.2.jar`.
+The plugin jar will be at `target/lavagolem-1.0.3.jar`.
 
 ## License
 

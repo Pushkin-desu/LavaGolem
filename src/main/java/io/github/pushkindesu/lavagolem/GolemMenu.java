@@ -53,30 +53,63 @@ public class GolemMenu implements Listener {
     /** Opens the settings menu for the given golem. */
     public void open(Player player, Mob golem) {
         plugin.markMenuOpen(golem); // hold the golem still while its menu is open
-        boolean smelter = isSmelter(golem);
         Holder holder = new Holder(golem.getUniqueId());
         Inventory inv = Bukkit.createInventory(holder, 9,
-                Component.text(plugin.msg.get(smelter ? "smelter-menu-title" : "hauler-menu-title"),
-                        NamedTextColor.DARK_GRAY));
+                Component.text(plugin.msg.get(menuTitleKey(role(golem))), NamedTextColor.DARK_GRAY));
         holder.inventory = inv;
         render(inv, golem);
         player.openInventory(inv);
     }
 
+    private String role(Mob golem) {
+        return golem.getPersistentDataContainer()
+                .getOrDefault(plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
+    }
+
+    private static String menuTitleKey(String role) {
+        if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "smelter-menu-title";
+        if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) return "alchemist-menu-title";
+        return "hauler-menu-title";
+    }
+
     private boolean isSmelter(Mob golem) {
-        return LavaGolemPlugin.ROLE_SMELTER.equals(golem.getPersistentDataContainer()
-                .getOrDefault(plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER));
+        return LavaGolemPlugin.ROLE_SMELTER.equals(role(golem));
+    }
+
+    /** Which tag (if any) the clicked slot edits — mirrors the layout in render(). */
+    private LavaGolemPlugin.GolemTag tagAt(Mob golem, int slot) {
+        if (isSmelter(golem)) {
+            return switch (slot) {
+                case 5 -> LavaGolemPlugin.GolemTag.SMELT;
+                case 6 -> LavaGolemPlugin.GolemTag.FUEL;
+                case 7 -> LavaGolemPlugin.GolemTag.OUTPUT;
+                default -> null;
+            };
+        }
+        return switch (slot) {
+            case 6 -> LavaGolemPlugin.GolemTag.BUCKETS;
+            case 7 -> LavaGolemPlugin.GolemTag.LAVA;
+            default -> null;
+        };
     }
 
     private void render(Inventory inv, Mob golem) {
         ItemStack filler = filler();
         for (int i = 0; i < 9; i++) inv.setItem(i, filler);
 
-        if (!isSmelter(golem)) {
-            // Lava Hauler: stats-only view (no work modes).
+        inv.setItem(8, powerButton(golem)); // every role can be switched off
+
+        String role = role(golem);
+        if (!LavaGolemPlugin.ROLE_SMELTER.equals(role)) {
+            // Lava Hauler: stats + the two containers it uses.
             inv.setItem(4, haulerStatsItem(golem));
+            inv.setItem(6, tagButton(golem, LavaGolemPlugin.GolemTag.BUCKETS, Material.BUCKET, "tag-buckets"));
+            inv.setItem(7, tagButton(golem, LavaGolemPlugin.GolemTag.LAVA, Material.LAVA_BUCKET, "tag-lava"));
             return;
         }
+        inv.setItem(5, tagButton(golem, LavaGolemPlugin.GolemTag.SMELT, Material.RAW_IRON, "tag-smelt"));
+        inv.setItem(6, tagButton(golem, LavaGolemPlugin.GolemTag.FUEL, Material.COAL, "tag-fuel"));
+        inv.setItem(7, tagButton(golem, LavaGolemPlugin.GolemTag.OUTPUT, Material.CHEST, "tag-output"));
 
         String current = golem.getPersistentDataContainer()
                 .getOrDefault(plugin.modeKey, PersistentDataType.STRING, LavaGolemPlugin.MODE_BALANCED);
@@ -89,6 +122,38 @@ public class GolemMenu implements Listener {
         inv.setItem(2, modeButton(Material.IRON_INGOT, "mode-collect-name", "mode-collect-desc",
                 LavaGolemPlugin.MODE_COLLECT_ONLY.equals(current)));
         inv.setItem(4, statsItem(golem));
+    }
+
+    /** Shows which container this golem looks for, and lets the player point it at its own. */
+    private ItemStack tagButton(Mob golem, LavaGolemPlugin.GolemTag tag, Material icon, String labelKey) {
+        boolean custom = plugin.hasTagOverride(golem, tag);
+        ItemStack item = new ItemStack(icon);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(Component.text(plugin.msg.get(labelKey) + plugin.tagFor(golem, tag),
+                custom ? NamedTextColor.AQUA : NamedTextColor.YELLOW).decoration(TextDecoration.ITALIC, false));
+        List<Component> lore = new ArrayList<>();
+        if (custom) {
+            lore.add(Component.text(plugin.msg.get("tag-default") + plugin.defaultTag(tag),
+                    NamedTextColor.DARK_GRAY).decoration(TextDecoration.ITALIC, false));
+        }
+        lore.add(Component.text(plugin.msg.get("tag-hint"), NamedTextColor.DARK_GRAY)
+                .decoration(TextDecoration.ITALIC, false));
+        meta.lore(lore);
+        meta.setEnchantmentGlintOverride(custom);
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private ItemStack powerButton(Mob golem) {
+        boolean paused = plugin.isPaused(golem);
+        ItemStack item = new ItemStack(paused ? Material.RED_DYE : Material.LIME_DYE);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(Component.text(plugin.msg.get(paused ? "power-paused" : "power-working"),
+                paused ? NamedTextColor.RED : NamedTextColor.GREEN).decoration(TextDecoration.ITALIC, false));
+        meta.lore(List.of(Component.text(plugin.msg.get("power-hint"), NamedTextColor.DARK_GRAY)
+                .decoration(TextDecoration.ITALIC, false)));
+        item.setItemMeta(meta);
+        return item;
     }
 
     private ItemStack haulerStatsItem(Mob golem) {
@@ -175,22 +240,47 @@ public class GolemMenu implements Listener {
         if (event.getClickedInventory() == null
                 || !(event.getClickedInventory().getHolder() instanceof Holder)) return;
 
-        String mode = switch (event.getRawSlot()) {
-            case 0 -> LavaGolemPlugin.MODE_BALANCED;
-            case 1 -> LavaGolemPlugin.MODE_LOAD_ONLY;
-            case 2 -> LavaGolemPlugin.MODE_COLLECT_ONLY;
-            default -> null;
-        };
-        if (mode == null) return;
-
+        int slot = event.getRawSlot();
         Entity ent = Bukkit.getEntity(holder.golemId);
         if (!(ent instanceof Mob golem) || !golem.isValid()) {
             event.getWhoClicked().closeInventory();
             return;
         }
+
+        if (slot == 8) {
+            plugin.setPaused(golem, !plugin.isPaused(golem));
+            render(event.getInventory(), golem);
+            click(event);
+            return;
+        }
+
+        // Tag slots: right-click names a custom container, left-click resets to the config default.
+        LavaGolemPlugin.GolemTag tag = tagAt(golem, slot);
+        if (tag != null) {
+            if (event.isRightClick() && event.getWhoClicked() instanceof Player p) {
+                plugin.tagPrompt.prompt(p, golem, tag);
+                return;
+            }
+            plugin.setTag(golem, tag, null);
+            render(event.getInventory(), golem);
+            click(event);
+            return;
+        }
+
+        String mode = switch (slot) {
+            case 0 -> LavaGolemPlugin.MODE_BALANCED;
+            case 1 -> LavaGolemPlugin.MODE_LOAD_ONLY;
+            case 2 -> LavaGolemPlugin.MODE_COLLECT_ONLY;
+            default -> null;
+        };
+        if (mode == null) return; // decorative slot
         if (!isSmelter(golem)) return; // hauler view has no work modes
         golem.getPersistentDataContainer().set(plugin.modeKey, PersistentDataType.STRING, mode);
         render(event.getInventory(), golem);
+        click(event);
+    }
+
+    private void click(InventoryClickEvent event) {
         if (event.getWhoClicked() instanceof Player p) {
             p.playSound(p.getLocation(), Sound.UI_BUTTON_CLICK, 0.6f, 1.2f);
         }
@@ -206,6 +296,8 @@ public class GolemMenu implements Listener {
     @EventHandler
     public void onClose(org.bukkit.event.inventory.InventoryCloseEvent event) {
         if (event.getInventory().getHolder() instanceof Holder holder) {
+            // Keep it held if the menu only closed so the player could type a tag in chat.
+            if (plugin.tagPrompt.hasPendingFor(holder.golemId)) return;
             plugin.markMenuClosed(holder.golemId); // resume the golem once its menu is closed
         }
     }
