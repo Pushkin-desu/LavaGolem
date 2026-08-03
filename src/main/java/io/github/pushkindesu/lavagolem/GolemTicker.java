@@ -42,6 +42,7 @@ public class GolemTicker extends BukkitRunnable {
     private final NamespacedKey courierRrKey;
     private final NamespacedKey courierFinalKey;
     private final NamespacedKey alchemyJobKey;
+    private final NamespacedKey biteTickKey;
     private int tickCount = 0;
 
     /** Transient per-golem "stuck" progress tracking for the courier's teleport fallback. */
@@ -81,6 +82,7 @@ public class GolemTicker extends BukkitRunnable {
         this.courierRrKey      = new NamespacedKey(plugin, "courier_rr");
         this.courierFinalKey   = new NamespacedKey(plugin, "courier_final");
         this.alchemyJobKey     = new NamespacedKey(plugin, "alchemy_job");
+        this.biteTickKey       = new NamespacedKey(plugin, "bite_tick");
     }
 
     @Override
@@ -115,12 +117,17 @@ public class GolemTicker extends BukkitRunnable {
         String role = pdc.getOrDefault(plugin.roleKey, PersistentDataType.STRING,
                 LavaGolemPlugin.ROLE_HAULER);
 
+        // A role switched off in the config sits inert until it's switched back on.
+        if (!plugin.isRoleEnabled(role)) return;
+
         if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) {
             tickSmelter(golem, pdc);
         } else if (LavaGolemPlugin.ROLE_COURIER.equals(role)) {
             tickCourier(golem, pdc);
         } else if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) {
             tickAlchemist(golem, pdc);
+        } else if (LavaGolemPlugin.ROLE_FISHER.equals(role)) {
+            tickFisher(golem, pdc);
         } else {
             tickHauler(golem, pdc);
         }
@@ -160,10 +167,23 @@ public class GolemTicker extends BukkitRunnable {
         }
     }
 
+    // ---- debug tracing (toggled per-golem by /golemdebug) ----
+    private boolean isDebug(Mob golem) { return plugin.debugWatchers.containsKey(golem.getUniqueId()); }
+
+    private void gdebug(Mob golem, String msg) {
+        java.util.UUID w = plugin.debugWatchers.get(golem.getUniqueId());
+        if (w == null) return;
+        org.bukkit.entity.Player p = Bukkit.getPlayer(w);
+        if (p == null) { plugin.debugWatchers.remove(golem.getUniqueId()); return; }
+        p.sendMessage(net.kyori.adventure.text.Component.text("[G] " + msg,
+                net.kyori.adventure.text.format.NamedTextColor.AQUA));
+    }
+
     /** Core decision engine: picks the single best action for an idle smelter golem. */
     private void smelterDecide(Mob golem) {
         if (!canSearch(golem)) return;
         Location origin = golem.getLocation();
+        boolean dbg = isDebug(golem);
 
         // Safety net: if we're still carrying an item (a delivery hit a full chest, a target
         // slot was occupied, or a station lacks an [Output]), deliver it BEFORE starting any new
@@ -184,7 +204,7 @@ public class GolemTicker extends BukkitRunnable {
 
         StationScan scan = scanStation(golem, origin);
         List<Block> furnaces = scan.furnaces;
-        if (furnaces.isEmpty()) { delayNextSearch(golem); return; }
+        if (furnaces.isEmpty()) { if (dbg) gdebug(golem, "idle: no furnaces in range"); delayNextSearch(golem); return; }
 
         Block outputChest = scan.outputChest;
         Block smeltChest = scan.smeltChest;
@@ -195,6 +215,9 @@ public class GolemTicker extends BukkitRunnable {
                 .getOrDefault(plugin.modeKey, PersistentDataType.STRING, LavaGolemPlugin.MODE_BALANCED);
         boolean canLoad = !LavaGolemPlugin.MODE_COLLECT_ONLY.equals(mode);
         boolean canCollect = !LavaGolemPlugin.MODE_LOAD_ONLY.equals(mode);
+        if (dbg) gdebug(golem, "decide mode=" + mode + " furnaces=" + furnaces.size()
+                + " smelt=" + (smeltChest != null) + " fuel=" + (fuelChest != null)
+                + " output=" + (outputChest != null));
 
         boolean canDeliver = canCollect && outputChest != null
                 && outputChest.getState() instanceof Container oc && !isContainerFull(oc);
@@ -234,6 +257,8 @@ public class GolemTicker extends BukkitRunnable {
         }
 
         // 2) INPUT — furnace with empty input slot, [Smelt] has a smeltable material
+        if (dbg && !canLoad) gdebug(golem, "step2 skipped: canLoad=false (collect-only mode)");
+        if (dbg && canLoad && smeltChest == null) gdebug(golem, "step2 skipped: no [Smelt] chest found");
         if (canLoad && smeltChest != null && smeltChest.getState() instanceof Container smeltChestState) {
             Inventory smeltInv = smeltChestState.getInventory();
             Map<Material, Integer> counts = new HashMap<>();
@@ -245,6 +270,7 @@ public class GolemTicker extends BukkitRunnable {
                         && !plugin.smokableInputs.contains(mt)) continue;
                 counts.merge(mt, stack.getAmount(), Integer::sum);
             }
+            if (dbg) gdebug(golem, "step2 smeltable-in-chest=" + counts);
 
             if (!counts.isEmpty()) {
                 // Pick the nearest idle furnace that can smelt something we have, together with
@@ -304,6 +330,8 @@ public class GolemTicker extends BukkitRunnable {
                         // Choose fuel for the ACTUAL batch size, not the whole pile, so a small
                         // per-furnace share doesn't needlessly commit a lava bucket.
                         Material chosenFuel = chooseFuel(fuelChest, n);
+                        if (dbg) gdebug(golem, "step2 furnace ok, batch=" + n + " material=" + bestMaterial
+                                + " chosenFuel=" + chosenFuel);
                         if (chosenFuel != null) {
                             clearSearchCooldown(golem);
                             setJobFurnace(golem, bestFurnace.getLocation());
@@ -313,7 +341,11 @@ public class GolemTicker extends BukkitRunnable {
                             setSmelterState(golem, "SMELTER_INPUT_CHEST");
                             return;
                         }
+                    } else if (dbg) {
+                        gdebug(golem, "step2 STALL: furnace has no fuel and no [Fuel] chest found");
                     }
+                } else if (dbg) {
+                    gdebug(golem, "step2: no idle furnace accepts the available material");
                 }
             }
         }
@@ -360,6 +392,7 @@ public class GolemTicker extends BukkitRunnable {
         }
 
         // 5) Nothing to do
+        if (dbg) gdebug(golem, "idle: nothing to do this cycle");
         delayNextSearch(golem);
     }
 
@@ -420,7 +453,7 @@ public class GolemTicker extends BukkitRunnable {
         int bestWaste = Integer.MAX_VALUE;
         int bestCap = -1;
         for (Material mat : available.keySet()) {
-            if (mat == Material.LAVA_BUCKET) continue; // only chosen above when a >= 32
+            if (mat == Material.LAVA_BUCKET) continue; // preferred only when a >= 32 (above)
             int cap = fuelCapacity(mat);
             int waste = cap * (int) Math.ceil(target / (double) cap) - target;
             if (waste < bestWaste || (waste == bestWaste && cap > bestCap)) {
@@ -428,6 +461,12 @@ public class GolemTicker extends BukkitRunnable {
                 bestCap = cap;
                 best = mat;
             }
+        }
+        // Lava is skipped above for small batches to avoid wasting a whole bucket — but if it's the
+        // ONLY fuel available, use it anyway. Otherwise a lava-only station stalls forever: the load
+        // step won't commit input it can't fuel, so nothing ever gets smelted.
+        if (best == null && available.containsKey(Material.LAVA_BUCKET)) {
+            return Material.LAVA_BUCKET;
         }
         return best;
     }
@@ -1659,6 +1698,582 @@ public class GolemTicker extends BukkitRunnable {
         clearTarget(golem);
         delayNextSearch(golem);
         setAlchemistState(golem, "ALCHEMIST_IDLE");
+    }
+
+    // ===== FISHER =====
+
+    /**
+     * The vanilla `gameplay/fishing` table picks between junk/treasure/fish itself, but we need that
+     * choice in our own hands for two reasons: the sub-table that produced an item is the only way to
+     * know whether it is treasure (and so belongs in [Treasure]), and treasure has to be gated on open
+     * water — a rule vanilla enforces on the bobber entity, which a golem doesn't have.
+     *
+     * So the split is reproduced here with vanilla's own weights and quality values, from
+     * `gameplay/fishing.json`. Effective weight is `weight + quality * luck`, which is what makes
+     * Luck of the Sea trade junk for treasure. The sub-tables themselves stay vanilla.
+     */
+    private static final int JUNK_WEIGHT = 10, JUNK_QUALITY = -2;
+    private static final int TREASURE_WEIGHT = 5, TREASURE_QUALITY = 2;
+    private static final int FISH_WEIGHT = 85, FISH_QUALITY = -1;
+
+    private final java.util.Random fishRng = new java.util.Random();
+
+    private void tickFisher(Mob golem, PersistentDataContainer pdc) {
+        String state = pdc.getOrDefault(stateKey, PersistentDataType.STRING, "FISHER_IDLE");
+
+        switch (state) {
+            case "FISHER_IDLE"     -> fisherDecide(golem);
+            case "FISHER_TO_RODS"  -> moveToTargetAlchemist(golem, this::onReachRodsChest);
+            case "FISHER_TO_WATER" -> moveToFisherShore(golem);
+            case "FISHER_FISHING"  -> fisherFish(golem);
+            case "FISHER_TO_OUTPUT"-> moveToTargetAlchemist(golem, this::onReachFisherOutput);
+            default -> setFisherState(golem, "FISHER_IDLE");
+        }
+    }
+
+    private void fisherDecide(Mob golem) {
+        if (!canSearch(golem)) return;
+        FisherScan scan = scanFisherStation(golem, golem.getLocation());
+
+        // 1) Carrying a catch: get rid of it first, so a full hand never blocks fishing.
+        ItemStack carried = golem.getEquipment().getItemInMainHand();
+        if (carried != null && carried.getType() != Material.AIR) {
+            Block dest = isTreasure(golem) && scan.treasureChest != null
+                    ? scan.treasureChest : scan.outputChest;
+            if (dest == null || !hasRoomFor(dest, carried)) { delayNextSearch(golem); return; }
+            setTarget(golem, dest.getLocation());
+            setFisherState(golem, "FISHER_TO_OUTPUT");
+            return;
+        }
+
+        // 2) No rod: fetch one. Without a rod there is nothing to do at all.
+        if (rodOf(golem) == null) {
+            if (scan.rodsChest == null || !(scan.rodsChest.getState() instanceof Container c)
+                    || takeableRodSlot(c) < 0) {
+                delayNextSearch(golem);
+                return;
+            }
+            setTarget(golem, scan.rodsChest.getLocation());
+            setFisherState(golem, "FISHER_TO_RODS");
+            return;
+        }
+
+        // 3) Rod in hand: go fish. Refuse to start with nowhere to put the catch, rather than
+        //    fishing something up and then standing there holding it.
+        if (scan.water == null) { delayNextSearch(golem); return; }
+        if (scan.outputChest == null && scan.treasureChest == null) { delayNextSearch(golem); return; }
+        // Stand on the bank and cast out to the (open) water, the way a player does. If the pond has no
+        // walkable bank in range we hold rather than wade in — never send the golem into the water.
+        if (scan.shore == null) { delayNextSearch(golem); return; }
+        setJobFurnace(golem, scan.water.getLocation()); // the cast point
+        setTarget(golem, scan.shore);                   // where to stand
+        setFisherState(golem, "FISHER_TO_WATER");
+    }
+
+    /** Walks to the bank spot and starts fishing once actually standing on it (a tight arrival, so it
+     *  ends up on land rather than stopping a couple of blocks short in the water). */
+    private void moveToFisherShore(Mob golem) {
+        Location target = getTarget(golem);
+        if (target == null) { clearSearchCooldown(golem); setFisherState(golem, "FISHER_IDLE"); return; }
+        if (golem.getLocation().distance(target) <= 1.3) {
+            clearTarget(golem);
+            onReachFishingSpot(golem);
+        } else {
+            golem.getPathfinder().moveTo(target, 1.0);
+        }
+    }
+
+    private void onReachRodsChest(Mob golem, Block block) {
+        if (!(block.getState() instanceof Container chest)) { abortFisher(golem); return; }
+        int slot = takeableRodSlot(chest);
+        if (slot < 0) { abortFisher(golem); return; }
+        ItemStack rod = chest.getInventory().getItem(slot);
+        ItemStack one = rod.clone();
+        one.setAmount(1);
+        rod.setAmount(rod.getAmount() - 1);
+        chest.getInventory().setItem(slot, rod.getAmount() <= 0 ? null : rod);
+        // The rod lives in the off-hand: it is the golem's tool and stays until it breaks, leaving
+        // the main hand free to carry each catch to the chest.
+        golem.getEquipment().setItemInOffHand(one);
+        bump(golem, plugin.rodsUsedKey);
+        setFisherState(golem, "FISHER_IDLE");
+        clearSearchCooldown(golem);
+    }
+
+    private void onReachFishingSpot(Mob golem) {
+        // The cast point was recorded at decide time; just confirm it's still water and start the wait.
+        Location water = getJobFurnace(golem);
+        if (water == null || !isFishable(water.getBlock())) { abortFisher(golem); return; }
+        golem.getPersistentDataContainer().set(biteTickKey, PersistentDataType.LONG,
+                Bukkit.getCurrentTick() + waitTicks(golem));
+        setFisherState(golem, "FISHER_FISHING");
+    }
+
+    /** Vanilla waits 100-600 ticks and Lure takes 100 off that per level. */
+    private long waitTicks(Mob golem) {
+        long min = plugin.cfg.fisherMinWaitTicks, max = plugin.cfg.fisherMaxWaitTicks;
+        long wait = min + (long) (fishRng.nextDouble() * (max - min + 1));
+        ItemStack rod = rodOf(golem);
+        int lure = rod == null ? 0 : rod.getEnchantmentLevel(org.bukkit.enchantments.Enchantment.LURE);
+        return Math.max(20, wait - 100L * lure);
+    }
+
+    /** Roughly one bite in six gets away — a fish you didn't reel in time. It still costs the rod a
+     *  point (you cast and reeled), and the golem simply casts again. */
+    private static final double FISH_MISS_CHANCE = 0.17;
+
+    private void fisherFish(Mob golem) {
+        Location spot = getJobFurnace(golem);
+        ItemStack rod = rodOf(golem);
+        if (spot == null || rod == null || !isFishable(spot.getBlock())) { abortFisher(golem); return; }
+        // The golem stands on the bank and casts out, so the cast point sits several blocks away —
+        // only a real displacement (pushed off, pond rebuilt) should abort. Kept generous on purpose.
+        if (golem.getLocation().distanceSquared(spot) > (plugin.cfg.searchRadius + 4) * (plugin.cfg.searchRadius + 4)) {
+            abortFisher(golem);
+            return;
+        }
+
+        // Face the cast point. There is no real bobber entity — that belongs to a player-owned hook,
+        // which wouldn't even render a line off a golem — so a particle "float" stands in for it.
+        golem.lookAt(spot.getX(), spot.getY() + 1, spot.getZ());
+        Location surface = spot.clone().add(0, 1, 0);
+
+        long now = Bukkit.getCurrentTick();
+        long bite = golem.getPersistentDataContainer()
+                .getOrDefault(biteTickKey, PersistentDataType.LONG, 0L);
+        // getCurrentTick() restarts from 0 with the server while biteTickKey persists, so a deadline
+        // left over from last session sits unreachably far ahead and the golem would fish forever.
+        // Anything further out than a whole wait window is stale — see canSearch for the same trap.
+        if (bite > now + plugin.cfg.fisherMaxWaitTicks) {
+            golem.getPersistentDataContainer().set(biteTickKey, PersistentDataType.LONG,
+                    now + waitTicks(golem));
+            return;
+        }
+        if (now < bite) {
+            // A float bobbing in place: one steady dot that rises and dips a little, so you can see
+            // exactly where the line is instead of a scattered shimmer.
+            double bob = Math.sin(now * 0.3) * 0.06;
+            Location floatLoc = surface.clone().add(0, bob, 0);
+            golem.getWorld().spawnParticle(org.bukkit.Particle.SPLASH, floatLoc, 1, 0, 0, 0, 0);
+            golem.getWorld().spawnParticle(org.bukkit.Particle.FISHING, floatLoc, 1, 0, 0, 0, 0);
+            // A trail of bubbles closing in on the float just before the bite.
+            if (bite - now <= 20) {
+                golem.getWorld().spawnParticle(org.bukkit.Particle.BUBBLE, surface, 3, 0.3, 0, 0.3, 0.01);
+            }
+            return;
+        }
+
+        // A bite. Reeling always costs the rod a point, catch or miss.
+        wearRod(golem, rod);
+        // A splash ring where the float went under.
+        golem.getWorld().spawnParticle(org.bukkit.Particle.SPLASH, surface, 16, 0.35, 0.05, 0.35, 0.12);
+        golem.getWorld().spawnParticle(org.bukkit.Particle.FISHING, surface, 10, 0.3, 0.1, 0.3, 0.05);
+
+        boolean got = fishRng.nextDouble() >= FISH_MISS_CHANCE;
+        ItemStack catchItem = got ? rollCatch(golem, spot.getBlock(), rod) : null;
+
+        if (catchItem == null) {
+            // Got away (or the rod just snapped mid-reel). If the rod's gone, re-decide to fetch a new
+            // one; otherwise recast where it stands.
+            golem.getWorld().playSound(golem.getLocation(),
+                    org.bukkit.Sound.ENTITY_FISHING_BOBBER_RETRIEVE, 0.5f, 0.7f);
+            if (rodOf(golem) == null) { abortFisher(golem); return; }
+            golem.getPersistentDataContainer().set(biteTickKey, PersistentDataType.LONG,
+                    now + waitTicks(golem));
+            return;
+        }
+
+        clearJobFurnace(golem);
+        golem.getPersistentDataContainer().remove(biteTickKey);
+        setFisherState(golem, "FISHER_IDLE");
+        clearSearchCooldown(golem);
+        golem.getEquipment().setItemInMainHand(catchItem);
+        golem.getWorld().playSound(golem.getLocation(),
+                org.bukkit.Sound.ENTITY_FISHING_BOBBER_RETRIEVE, 0.6f, 1.0f);
+    }
+
+    /**
+     * A single weighted entry in a fishing sub-table: a stack to hand out, and how likely it is
+     * relative to its siblings. {@code custom} entries come from the config and are handed out exactly
+     * as configured (no vanilla decoration), so a configured diamond is a plain diamond.
+     */
+    private record Catch(int weight, Material material, int amount, boolean custom) {
+        Catch(int weight, Material material, int amount) { this(weight, material, amount, false); }
+    }
+
+    /** The base table plus any config custom-catches assigned to this pool. */
+    private List<Catch> withCustom(List<Catch> base, String pool) {
+        List<Catch> out = new ArrayList<>(base);
+        for (var cc : plugin.cfg.customCatches) {
+            if (cc.pool().equals(pool)) out.add(new Catch(cc.weight(), cc.material(), cc.amount(), true));
+        }
+        return out;
+    }
+
+    // The vanilla fishing sub-tables, transcribed from gameplay/fishing/{fish,junk,treasure}.json.
+    // The server API refuses to run these tables for us — its LootContext can't supply the `tool`
+    // parameter vanilla's fishing predicates require — so the weights and items are kept here by
+    // hand, exactly as the Alchemist keeps the brewing recipes the API also won't enumerate. A new
+    // vanilla catch would need a plugin update to appear; for fishing that changes about once a
+    // decade. Decoration (water bottle, damage, enchants) is applied in decorateCatch().
+    private static final List<Catch> FISH_TABLE = List.of(
+            new Catch(60, Material.COD, 1),
+            new Catch(25, Material.SALMON, 1),
+            new Catch(13, Material.PUFFERFISH, 1),
+            new Catch(2,  Material.TROPICAL_FISH, 1));
+
+    private static final List<Catch> JUNK_TABLE = List.of(
+            new Catch(17, Material.LILY_PAD, 1),
+            new Catch(10, Material.BOWL, 1),
+            new Catch(10, Material.LEATHER, 1),
+            new Catch(10, Material.LEATHER_BOOTS, 1),
+            new Catch(10, Material.ROTTEN_FLESH, 1),
+            new Catch(10, Material.POTION, 1),       // decorated into a water bottle
+            new Catch(10, Material.BONE, 1),
+            new Catch(10, Material.TRIPWIRE_HOOK, 1),
+            new Catch(10, Material.BAMBOO, 1),
+            new Catch(5,  Material.STICK, 1),
+            new Catch(5,  Material.STRING, 1),
+            new Catch(2,  Material.FISHING_ROD, 1),  // decorated: damaged
+            new Catch(1,  Material.INK_SAC, 10));
+
+    private static final List<Catch> TREASURE_TABLE = List.of(
+            new Catch(1, Material.BOW, 1),           // decorated: enchanted + damaged
+            new Catch(1, Material.ENCHANTED_BOOK, 1),// decorated: enchanted
+            new Catch(1, Material.FISHING_ROD, 1),   // decorated: enchanted + damaged
+            new Catch(1, Material.NAME_TAG, 1),
+            new Catch(1, Material.NAUTILUS_SHELL, 1),
+            new Catch(1, Material.SADDLE, 1));
+
+    /**
+     * Rolls one catch, reproducing vanilla's fishing outcome: the junk/treasure/fish split (with
+     * Luck of the Sea trading junk for treasure), then a weighted pick within the chosen sub-table.
+     * Records whether it was treasure so the delivery step can route it to [Treasure].
+     */
+    private ItemStack rollCatch(Mob golem, Block water, ItemStack rod) {
+        int luck = rod.getEnchantmentLevel(org.bukkit.enchantments.Enchantment.LUCK_OF_THE_SEA);
+        boolean treasureOk = plugin.cfg.fisherTreasure && isOpenWater(water);
+
+        int junk = Math.max(0, JUNK_WEIGHT + JUNK_QUALITY * luck);
+        int fish = Math.max(0, FISH_WEIGHT + FISH_QUALITY * luck);
+        int treasure = treasureOk ? Math.max(0, TREASURE_WEIGHT + TREASURE_QUALITY * luck) : 0;
+        int total = junk + fish + treasure;
+        if (total <= 0) return null;
+
+        int roll = fishRng.nextInt(total);
+        List<Catch> table;
+        boolean isTreasure = false;
+        if (roll < junk) {
+            table = withCustom(JUNK_TABLE, "junk");
+        } else if (roll < junk + treasure) {
+            table = withCustom(TREASURE_TABLE, "treasure");
+            isTreasure = true;
+        } else {
+            table = withCustom(FISH_TABLE, "fish");
+        }
+
+        ItemStack result = decorateCatch(pickWeighted(table), isTreasure);
+        if (result == null) return null;
+        golem.getPersistentDataContainer().set(
+                plugin.treasureFlagKey, PersistentDataType.BYTE, (byte) (isTreasure ? 1 : 0));
+        bump(golem, isTreasure ? plugin.treasureCaughtKey : plugin.fishCaughtKey);
+        return result;
+    }
+
+    private Catch pickWeighted(List<Catch> table) {
+        int total = 0;
+        for (Catch c : table) total += c.weight();
+        int roll = fishRng.nextInt(total);
+        for (Catch c : table) {
+            roll -= c.weight();
+            if (roll < 0) return c;
+        }
+        return table.get(table.size() - 1); // unreachable, but keeps the compiler happy
+    }
+
+    /** Turns a table entry into the item vanilla would actually hand out: a water bottle for the
+     *  junk potion, worn-and-enchanted gear for treasure, a battered rod for junk. */
+    private ItemStack decorateCatch(Catch c, boolean isTreasure) {
+        ItemStack item = new ItemStack(c.material(), c.amount());
+        if (c.custom()) return item; // config item: hand it over exactly as configured
+        switch (c.material()) {
+            case POTION -> {
+                if (item.getItemMeta() instanceof org.bukkit.inventory.meta.PotionMeta pm) {
+                    pm.setBasePotionType(org.bukkit.potion.PotionType.WATER);
+                    item.setItemMeta(pm);
+                }
+            }
+            case ENCHANTED_BOOK -> enchantBook(item);
+            case BOW, FISHING_ROD -> {
+                if (isTreasure) enchantGear(item);
+                randomDamage(item); // both junk and treasure rods/bows come up worn
+            }
+            case LEATHER_BOOTS -> randomDamage(item);
+            default -> { /* fish and plain junk need nothing */ }
+        }
+        return item;
+    }
+
+    // Treasure gear comes enchanted in vanilla (an "enchant with levels 30" roll). The exact algorithm
+    // isn't exposed, so we approximate: one or two fitting enchantments at a random valid level.
+    private static final org.bukkit.enchantments.Enchantment[] BOW_ENCHANTS = {
+            org.bukkit.enchantments.Enchantment.POWER, org.bukkit.enchantments.Enchantment.PUNCH,
+            org.bukkit.enchantments.Enchantment.FLAME, org.bukkit.enchantments.Enchantment.INFINITY,
+            org.bukkit.enchantments.Enchantment.UNBREAKING, org.bukkit.enchantments.Enchantment.MENDING};
+    private static final org.bukkit.enchantments.Enchantment[] ROD_ENCHANTS = {
+            org.bukkit.enchantments.Enchantment.LUCK_OF_THE_SEA, org.bukkit.enchantments.Enchantment.LURE,
+            org.bukkit.enchantments.Enchantment.UNBREAKING, org.bukkit.enchantments.Enchantment.MENDING};
+    private static final org.bukkit.enchantments.Enchantment[] BOOK_ENCHANTS = {
+            org.bukkit.enchantments.Enchantment.SHARPNESS, org.bukkit.enchantments.Enchantment.PROTECTION,
+            org.bukkit.enchantments.Enchantment.EFFICIENCY, org.bukkit.enchantments.Enchantment.FORTUNE,
+            org.bukkit.enchantments.Enchantment.SILK_TOUCH, org.bukkit.enchantments.Enchantment.UNBREAKING,
+            org.bukkit.enchantments.Enchantment.MENDING, org.bukkit.enchantments.Enchantment.FEATHER_FALLING,
+            org.bukkit.enchantments.Enchantment.RESPIRATION, org.bukkit.enchantments.Enchantment.LOOTING};
+
+    private void enchantGear(ItemStack item) {
+        var pool = item.getType() == Material.BOW ? BOW_ENCHANTS : ROD_ENCHANTS;
+        int count = 1 + fishRng.nextInt(2);
+        for (int i = 0; i < count; i++) {
+            var ench = pool[fishRng.nextInt(pool.length)];
+            int level = 1 + fishRng.nextInt(Math.max(1, ench.getMaxLevel()));
+            item.addUnsafeEnchantment(ench, level);
+        }
+    }
+
+    private void enchantBook(ItemStack book) {
+        if (!(book.getItemMeta() instanceof org.bukkit.inventory.meta.EnchantmentStorageMeta meta)) return;
+        var ench = BOOK_ENCHANTS[fishRng.nextInt(BOOK_ENCHANTS.length)];
+        int level = 1 + fishRng.nextInt(Math.max(1, ench.getMaxLevel()));
+        meta.addStoredEnchant(ench, level, true);
+        book.setItemMeta(meta);
+    }
+
+    /** A fished-up tool is worn: vanilla damages it 10%-90%. */
+    private void randomDamage(ItemStack item) {
+        if (!(item.getItemMeta() instanceof org.bukkit.inventory.meta.Damageable dmg)) return;
+        int max = item.getType().getMaxDurability();
+        if (max <= 0) return;
+        dmg.setDamage((int) (max * (0.10 + fishRng.nextDouble() * 0.80)));
+        item.setItemMeta(dmg);
+    }
+
+    private boolean isTreasure(Mob golem) {
+        return golem.getPersistentDataContainer()
+                .getOrDefault(plugin.treasureFlagKey, PersistentDataType.BYTE, (byte) 0) == (byte) 1;
+    }
+
+    /**
+     * Spends a point of the rod's durability, respecting Unbreaking (a 1-in-(level+1) chance to be
+     * spared), and snaps the rod when it is used up. The golem earns no XP, so Mending can never
+     * repair it — rods genuinely run out, which is what keeps a fisher a resource sink.
+     */
+    private void wearRod(Mob golem, ItemStack rod) {
+        int unbreaking = rod.getEnchantmentLevel(org.bukkit.enchantments.Enchantment.UNBREAKING);
+        if (unbreaking > 0 && fishRng.nextInt(unbreaking + 1) != 0) return;
+
+        if (!(rod.getItemMeta() instanceof org.bukkit.inventory.meta.Damageable dmg)) return;
+        int max = dmg.hasMaxDamage() ? dmg.getMaxDamage() : rod.getType().getMaxDurability();
+        int next = dmg.getDamage() + 1;
+        if (next >= max) {
+            golem.getEquipment().setItemInOffHand(null);
+            golem.getWorld().playSound(golem.getLocation(),
+                    org.bukkit.Sound.ENTITY_ITEM_BREAK, 0.8f, 1.0f);
+            return;
+        }
+        dmg.setDamage(next);
+        rod.setItemMeta(dmg);
+        golem.getEquipment().setItemInOffHand(rod);
+    }
+
+    private void onReachFisherOutput(Mob golem, Block block) {
+        if (!(block.getState() instanceof Container chest)) { abortFisher(golem); return; }
+        ItemStack carried = golem.getEquipment().getItemInMainHand();
+        if (carried == null || carried.getType() == Material.AIR) {
+            setFisherState(golem, "FISHER_IDLE");
+            return;
+        }
+        var leftover = chest.getInventory().addItem(carried);
+        if (!leftover.isEmpty()) { abortFisher(golem); return; } // filled up en route; try again
+        golem.getEquipment().setItemInMainHand(null);
+        golem.getPersistentDataContainer().remove(plugin.treasureFlagKey);
+        setFisherState(golem, "FISHER_IDLE");
+        clearSearchCooldown(golem);
+    }
+
+    /** A rod the golem can actually fish with — any fishing rod that isn't already worn out. */
+    private int takeableRodSlot(Container chest) {
+        Inventory inv = chest.getInventory();
+        for (int i = 0; i < inv.getSize(); i++) {
+            ItemStack st = inv.getItem(i);
+            if (st == null || st.getType() != Material.FISHING_ROD) continue;
+            if (st.getItemMeta() instanceof org.bukkit.inventory.meta.Damageable dmg) {
+                int max = dmg.hasMaxDamage() ? dmg.getMaxDamage() : st.getType().getMaxDurability();
+                if (dmg.getDamage() >= max) continue;
+            }
+            return i;
+        }
+        return -1;
+    }
+
+    private ItemStack rodOf(Mob golem) {
+        ItemStack off = golem.getEquipment().getItemInOffHand();
+        return (off != null && off.getType() == Material.FISHING_ROD) ? off : null;
+    }
+
+    /** Only real water is fishable — a cauldron is not a pond. */
+    private boolean isFishable(Block b) {
+        return b.getType() == Material.WATER
+                && (!(b.getBlockData() instanceof org.bukkit.block.data.Levelled lv) || lv.getLevel() == 0);
+    }
+
+    /**
+     * Vanilla only yields treasure in open water: a 5x5 area of water around the bobber, clear above.
+     * Approximated here around the golem's fishing block, which is what stops a 1x1 hole in the floor
+     * from being a treasure farm and makes you dig a real pond.
+     */
+    private boolean isOpenWater(Block water) {
+        for (int dx = -2; dx <= 2; dx++) {
+            for (int dz = -2; dz <= 2; dz++) {
+                Block b = water.getRelative(dx, 0, dz);
+                if (b.getType() != Material.WATER) return false;
+                if (!b.getRelative(0, 1, 0).getType().isAir()) return false;
+            }
+        }
+        return true;
+    }
+
+    private boolean hasRoomFor(Block chestBlock, ItemStack item) {
+        if (!(chestBlock.getState() instanceof Container c)) return false;
+        Inventory inv = c.getInventory();
+        for (int i = 0; i < inv.getSize(); i++) {
+            ItemStack st = inv.getItem(i);
+            if (st == null || st.getType() == Material.AIR) return true;
+            if (st.isSimilar(item) && st.getAmount() < st.getMaxStackSize()) return true;
+        }
+        return false;
+    }
+
+    private void bump(Mob golem, NamespacedKey key) {
+        var pdc = golem.getPersistentDataContainer();
+        pdc.set(key, PersistentDataType.INTEGER,
+                pdc.getOrDefault(key, PersistentDataType.INTEGER, 0) + 1);
+    }
+
+    private static final class FisherScan {
+        Block rodsChest, outputChest, treasureChest, water;
+        Location shore; // a land spot at the pond's edge, nearest the golem — where it stands to cast
+        double rodsDist = Double.MAX_VALUE, outputDist = Double.MAX_VALUE,
+               treasureDist = Double.MAX_VALUE, waterDist = Double.MAX_VALUE,
+               shoreDist = Double.MAX_VALUE;
+    }
+
+    /** A dry standing spot beside a water block: an air-over-solid-land neighbour that isn't itself
+     *  water and isn't floating on water. Returns the golem's feet location, or null if the block has
+     *  no walkable bank (an interior pond block, or water walled in). */
+    /** True if the golem could stand at {@code feet}: air for body and head, a solid non-water floor
+     *  under it. */
+    private boolean standable(Block feet) {
+        if (feet.getType() == Material.WATER) return false;
+        Block head = feet.getRelative(0, 1, 0);
+        Block below = feet.getRelative(0, -1, 0);
+        if (below.getType() == Material.WATER) return false; // floating on the surface — not a foothold
+        return feet.isPassable() && head.isPassable() && below.getType().isSolid();
+    }
+
+    /**
+     * Finds a dry foothold from which to fish this water block: a bank beside it, or a deck above it
+     * (a pier/bridge). Returns the golem's feet location, or null if there's nowhere to stand.
+     *
+     * Two shapes are covered. A **bank** is a standing spot in one of the eight horizontal neighbours,
+     * within a couple of blocks up or one down (grass at the water's level, a low ledge, a shallow
+     * step) — the everyday pond edge. A **deck** is the first solid block going straight up the water
+     * column (a pier walkway some blocks above the surface); the golem stands on top of it and casts
+     * down. Banks win over decks, and lower spots win over higher, so it hugs the nearest real edge.
+     */
+    private Location shoreSpotForWater(Block water) {
+        int[][] off = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}};
+        for (int dy = -1; dy <= 2; dy++) {          // lower spots first: hug the water's own level
+            for (int[] o : off) {
+                Block feet = water.getRelative(o[0], dy, o[1]);
+                if (standable(feet)) {
+                    return new Location(feet.getWorld(),
+                            feet.getX() + 0.5, feet.getY(), feet.getZ() + 0.5);
+                }
+            }
+        }
+        // No bank beside it — look for a deck directly above (a pier). Rise until the first solid
+        // block, then stand on top of it if there's headroom.
+        for (int up = 2; up <= 8; up++) {
+            Block b = water.getRelative(0, up, 0);
+            if (b.getType() == Material.WATER) continue;
+            if (b.getType().isSolid()) {
+                Block feet = b.getRelative(0, 1, 0);
+                if (feet.isPassable() && feet.getRelative(0, 1, 0).isPassable()) {
+                    return new Location(feet.getWorld(),
+                            feet.getX() + 0.5, feet.getY(), feet.getZ() + 0.5);
+                }
+                break; // solid but capped — the column is blocked, no deck here
+            }
+        }
+        return null;
+    }
+
+    /** One pass over the search cube for the [Rods]/[Output]/[Treasure] containers and the nearest
+     *  fishable water. Prefers open water, so a fisher with a real pond in range gets the treasure
+     *  rolls even if a decorative puddle happens to sit closer. */
+    private FisherScan scanFisherStation(Mob golem, Location origin) {
+        World world = origin.getWorld();
+        int ox = origin.getBlockX(), oy = origin.getBlockY(), oz = origin.getBlockZ();
+        int r = plugin.cfg.searchRadius;
+        String rodsTag     = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.RODS);
+        String outputTag   = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT);
+        String treasureTag = plugin.tagFor(golem, LavaGolemPlugin.GolemTag.TREASURE);
+        FisherScan scan = new FisherScan();
+        boolean waterIsOpen = false;
+        for (int dx = -r; dx <= r; dx++) {
+            for (int dy = -4; dy <= 4; dy++) {
+                for (int dz = -r; dz <= r; dz++) {
+                    Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
+                    Material t = b.getType();
+                    double d = b.getLocation().distanceSquared(origin);
+                    if (isFishable(b)) {
+                        boolean open = isOpenWater(b);
+                        // An open-water spot always beats a closed one; distance only breaks ties.
+                        if ((open && !waterIsOpen) || (open == waterIsOpen && d < scan.waterDist)) {
+                            scan.waterDist = d; scan.water = b; waterIsOpen = open;
+                        }
+                        // Track the bank spot nearest the golem, from whichever edge water touches land.
+                        Location bank = shoreSpotForWater(b);
+                        if (bank != null) {
+                            double bd = bank.distanceSquared(origin);
+                            if (bd < scan.shoreDist) { scan.shoreDist = bd; scan.shore = bank; }
+                        }
+                        continue;
+                    }
+                    if (!isStorageMaterial(t)) continue;
+                    if (containerHasTag(b, rodsTag)) {
+                        if (d < scan.rodsDist) { scan.rodsDist = d; scan.rodsChest = b; }
+                    } else if (containerHasTag(b, treasureTag)) {
+                        if (d < scan.treasureDist) { scan.treasureDist = d; scan.treasureChest = b; }
+                    } else if (containerHasTag(b, outputTag)) {
+                        if (d < scan.outputDist) { scan.outputDist = d; scan.outputChest = b; }
+                    }
+                }
+            }
+        }
+        return scan;
+    }
+
+    private void setFisherState(Mob golem, String state) {
+        golem.getPersistentDataContainer().set(stateKey, PersistentDataType.STRING, state);
+    }
+
+    private void abortFisher(Mob golem) {
+        clearJobFurnace(golem);
+        clearTarget(golem);
+        golem.getPersistentDataContainer().remove(biteTickKey);
+        delayNextSearch(golem);
+        setFisherState(golem, "FISHER_IDLE");
     }
 
     // ===== COURIER =====

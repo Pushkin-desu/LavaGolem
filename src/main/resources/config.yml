@@ -30,7 +30,7 @@ smelt-sign-text: "[Smelt]"
 fuel-sign-text: "[Fuel]"
 
 # Containers where smelted output (and spent buckets) are delivered (Smelter golem).
-# The Alchemist delivers finished potions here too.
+# The Alchemist delivers finished potions here too, and the Fisher its catch.
 output-sign-text: "[Output]"
 
 # --- Alchemist golem ---
@@ -39,6 +39,43 @@ output-sign-text: "[Output]"
 # It also needs brewing stands, a water source or water cauldron to fill bottles at, and a
 # crafting table (only if you give it blaze rods instead of powder).
 brew-sign-text: "[Brew]"
+
+# --- Fisher golem ---
+# The fisher takes a rod from this container and fishes with it until it breaks, then takes the
+# next one. Enchantments on YOUR rod are what matter: Luck of the Sea improves the catch, Lure
+# shortens the wait, Unbreaking makes the rod last. Mending does nothing — the golem earns no XP.
+rods-sign-text: "[Rods]"
+# Optional. If a container with this tag is in range, treasure (enchanted books, name tags, the
+# bow and rod, nautilus shells...) goes here and only ordinary fish and junk go to [Output].
+# Without it, everything lands in [Output].
+treasure-sign-text: "[Treasure]"
+# The wait between catches, in ticks. Vanilla's own window is 100-600 (5-30s); Lure shortens it
+# by 100 per level. Raise these to slow the fisher down.
+fisher-min-wait-ticks: 100
+fisher-max-wait-ticks: 600
+# Treasure needs open water in vanilla, and so it does here: 5x5 of water around the golem's spot
+# with open sky-side air above. Set false to switch treasure off entirely (fish and junk only).
+fisher-treasure: true
+# Add your own items to the catch. Each entry joins ONE pool and competes with the vanilla items in
+# it by weight — so a treasure entry only shows up on the ~5% of casts that roll treasure. For a
+# rough feel: a fish/junk pool has a total weight around 100, the treasure pool around 6.
+#   material: any item id (DIAMOND, EMERALD, ENCHANTED_GOLDEN_APPLE, ...)
+#   weight:   relative chance within its pool (higher = more common)
+#   amount:   stack size handed out (default 1)
+#   pool:     fish | junk | treasure  (treasure entries go to a [Treasure] container if you have one)
+# Config items are handed over exactly as written — no vanilla wear or enchanting is applied.
+fisher-custom-catches: []
+#  - { material: DIAMOND, weight: 2, amount: 1, pool: treasure }
+#  - { material: EMERALD, weight: 5, amount: 1, pool: junk }
+
+# --- Turn golems on or off ---
+# A disabled golem can't be crafted or placed, and any that already exist stop working until you
+# switch it back on. Everything is on by default.
+enable-lava-golem: true
+enable-smelter-golem: true
+enable-courier-golem: true
+enable-alchemist-golem: true
+enable-fisher-golem: true
 
 # --- Courier golem ---
 # The courier carries items between tagged containers along routes you set in its GUI.

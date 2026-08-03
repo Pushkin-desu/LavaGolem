@@ -53,6 +53,12 @@ public class HeartUseListener implements Listener {
         Player player = event.getPlayer();
         event.setCancelled(true);
 
+        // Refuse to place a role the server has switched off (leaves the heart in hand).
+        if (!plugin.isRoleEnabled(role)) {
+            player.sendMessage(Component.text(plugin.msg.get("role-disabled"), NamedTextColor.RED));
+            return;
+        }
+
         Location loc = event.getClickedBlock().getLocation().add(0.5, 1.0, 0.5);
         spawnLavaGolem(loc, role);
 
@@ -67,6 +73,7 @@ public class HeartUseListener implements Listener {
         if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "SMELTER_IDLE";
         if (LavaGolemPlugin.ROLE_COURIER.equals(role)) return "COURIER_IDLE";
         if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) return "ALCHEMIST_IDLE";
+        if (LavaGolemPlugin.ROLE_FISHER.equals(role)) return "FISHER_IDLE";
         return "SEEKING_BUCKET";
     }
 
@@ -74,6 +81,7 @@ public class HeartUseListener implements Listener {
         if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "smelter-name";
         if (LavaGolemPlugin.ROLE_COURIER.equals(role)) return "courier-name";
         if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) return "alchemist-name";
+        if (LavaGolemPlugin.ROLE_FISHER.equals(role)) return "fisher-name";
         return "golem-name";
     }
 
@@ -123,7 +131,8 @@ public class HeartUseListener implements Listener {
      * Recreates a golem loaded from disk, restoring ALL of its PDC state by copying the raw
      * container (so any current or future key survives a chunk reload without hand-threading).
      */
-    public void spawnLavaGolemRestored(Location loc, byte[] pdcBytes, String role, ItemStack heldItem) {
+    public void spawnLavaGolemRestored(Location loc, byte[] pdcBytes, String role,
+                                       ItemStack heldItem, ItemStack offHandItem) {
         CopperGolem golem =
                 (CopperGolem) loc.getWorld().spawnEntity(loc, EntityType.COPPER_GOLEM);
 
@@ -155,6 +164,11 @@ public class HeartUseListener implements Listener {
         if (heldItem != null && heldItem.getType() != Material.AIR) {
             golem.getEquipment().setItemInMainHand(heldItem);
         }
+        // The fisher's rod lives in the off-hand and must survive a chunk reload with it — a golem
+        // that came back empty-handed would quietly fetch a fresh rod and the old one would vanish.
+        if (offHandItem != null && offHandItem.getType() != Material.AIR) {
+            golem.getEquipment().setItemInOffHand(offHandItem);
+        }
     }
 
     @EventHandler
@@ -181,11 +195,13 @@ public class HeartUseListener implements Listener {
                 catch (java.io.IOException e) { pdcBytes = null; }
                 ItemStack held = (old.getEquipment() != null)
                         ? old.getEquipment().getItemInMainHand() : null;
+                ItemStack offHand = (old.getEquipment() != null)
+                        ? old.getEquipment().getItemInOffHand() : null;
 
                 plugin.cleanedUpGolems.remove(old.getUniqueId());
                 old.remove();
 
-                spawnLavaGolemRestored(loc, pdcBytes, role, held);
+                spawnLavaGolemRestored(loc, pdcBytes, role, held, offHand);
             }
         });
     }
@@ -220,6 +236,11 @@ public class HeartUseListener implements Listener {
             if (inHand != null && inHand.getType() != Material.AIR) {
                 golem.getWorld().dropItemNaturally(golem.getLocation(), inHand);
             }
+            // The fisher holds its rod in the off-hand; give that back too, part-worn as it is.
+            ItemStack offHand = golem.getEquipment().getItemInOffHand();
+            if (offHand != null && offHand.getType() != Material.AIR) {
+                golem.getWorld().dropItemNaturally(golem.getLocation(), offHand);
+            }
             plugin.cleanedUpGolems.remove(golem.getUniqueId());
             golem.remove();
             player.sendMessage(Component.text(plugin.msg.get("golem-disassembled"), NamedTextColor.GRAY));
@@ -234,7 +255,8 @@ public class HeartUseListener implements Listener {
             } else if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) {
                 plugin.alchemistMenu.open(player, golem); // which potions to brew + stats
             } else {
-                plugin.golemMenu.open(player, golem); // smelter (modes + stats), hauler (stats)
+                // smelter (modes + stats), fisher (tags + stats), hauler (stats)
+                plugin.golemMenu.open(player, golem);
             }
         }
     }
