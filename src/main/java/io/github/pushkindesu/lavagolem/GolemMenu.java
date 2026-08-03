@@ -69,11 +69,16 @@ public class GolemMenu implements Listener {
     private static String menuTitleKey(String role) {
         if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) return "smelter-menu-title";
         if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) return "alchemist-menu-title";
+        if (LavaGolemPlugin.ROLE_FISHER.equals(role)) return "fisher-menu-title";
         return "hauler-menu-title";
     }
 
     private boolean isSmelter(Mob golem) {
         return LavaGolemPlugin.ROLE_SMELTER.equals(role(golem));
+    }
+
+    private boolean isFisher(Mob golem) {
+        return LavaGolemPlugin.ROLE_FISHER.equals(role(golem));
     }
 
     /** Which tag (if any) the clicked slot edits — mirrors the layout in render(). */
@@ -83,6 +88,14 @@ public class GolemMenu implements Listener {
                 case 5 -> LavaGolemPlugin.GolemTag.SMELT;
                 case 6 -> LavaGolemPlugin.GolemTag.FUEL;
                 case 7 -> LavaGolemPlugin.GolemTag.OUTPUT;
+                default -> null;
+            };
+        }
+        if (isFisher(golem)) {
+            return switch (slot) {
+                case 5 -> LavaGolemPlugin.GolemTag.RODS;
+                case 6 -> LavaGolemPlugin.GolemTag.OUTPUT;
+                case 7 -> LavaGolemPlugin.GolemTag.TREASURE;
                 default -> null;
             };
         }
@@ -100,6 +113,15 @@ public class GolemMenu implements Listener {
         inv.setItem(8, powerButton(golem)); // every role can be switched off
 
         String role = role(golem);
+        if (LavaGolemPlugin.ROLE_FISHER.equals(role)) {
+            // Fisher: stats + the containers it uses. [Treasure] is optional, so its button says so.
+            inv.setItem(4, fisherStatsItem(golem));
+            inv.setItem(5, tagButton(golem, LavaGolemPlugin.GolemTag.RODS, Material.FISHING_ROD, "tag-rods"));
+            inv.setItem(6, tagButton(golem, LavaGolemPlugin.GolemTag.OUTPUT, Material.CHEST, "tag-output"));
+            inv.setItem(7, tagButton(golem, LavaGolemPlugin.GolemTag.TREASURE,
+                    Material.NAUTILUS_SHELL, "tag-treasure"));
+            return;
+        }
         if (!LavaGolemPlugin.ROLE_SMELTER.equals(role)) {
             // Lava Hauler: stats + the two containers it uses.
             inv.setItem(4, haulerStatsItem(golem));
@@ -173,6 +195,34 @@ public class GolemMenu implements Listener {
                 Component.text(plugin.msg.get("stats-delivered") + lava, NamedTextColor.GRAY)
                         .decoration(TextDecoration.ITALIC, false),
                 Component.text(plugin.msg.get("stats-buckets") + buckets, NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text(plugin.msg.get("stats-since") + dateStr, NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false)
+        ));
+        item.setItemMeta(meta);
+        return item;
+    }
+
+    private ItemStack fisherStatsItem(Mob golem) {
+        var pdc = golem.getPersistentDataContainer();
+        int fish = pdc.getOrDefault(plugin.fishCaughtKey, PersistentDataType.INTEGER, 0);
+        int treasure = pdc.getOrDefault(plugin.treasureCaughtKey, PersistentDataType.INTEGER, 0);
+        int rods = pdc.getOrDefault(plugin.rodsUsedKey, PersistentDataType.INTEGER, 0);
+        long createdAt = pdc.getOrDefault(plugin.createdAtKey, PersistentDataType.LONG, 0L);
+        String dateStr = (createdAt == 0L)
+                ? plugin.msg.get("stats-since-unknown")
+                : DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm")
+                        .format(LocalDateTime.ofInstant(Instant.ofEpochMilli(createdAt), ZoneId.systemDefault()));
+        ItemStack item = new ItemStack(Material.PAPER);
+        ItemMeta meta = item.getItemMeta();
+        meta.displayName(Component.text(plugin.msg.get("menu-stats-name"), NamedTextColor.GOLD)
+                .decoration(TextDecoration.ITALIC, false));
+        meta.lore(List.of(
+                Component.text(plugin.msg.get("stats-fish") + fish, NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text(plugin.msg.get("stats-treasure") + treasure, NamedTextColor.GRAY)
+                        .decoration(TextDecoration.ITALIC, false),
+                Component.text(plugin.msg.get("stats-rods") + rods, NamedTextColor.GRAY)
                         .decoration(TextDecoration.ITALIC, false),
                 Component.text(plugin.msg.get("stats-since") + dateStr, NamedTextColor.GRAY)
                         .decoration(TextDecoration.ITALIC, false)

@@ -1,5 +1,5 @@
 name: LavaGolem
-version: 1.0.3
+version: 1.0.4
 main: io.github.pushkindesu.lavagolem.LavaGolemPlugin
 api-version: '1.21'
 authors: [Pushkin-desu]
@@ -11,6 +11,9 @@ commands:
     permission: lavagolem.admin
   golemstats:
     description: Show aggregate statistics for all lava golems
+    permission: lavagolem.admin
+  golemdebug:
+    description: Toggle live decision tracing for the nearest golem
     permission: lavagolem.admin
 permissions:
   lavagolem.admin:

@@ -11,18 +11,20 @@ Everything about setting the golems up, and what to do when a courier won't move
 - [🪣 Lava Golem](#-lava-golem)
 - [🔥 Smelter Golem](#-smelter-golem)
 - [⚗️ Alchemist Golem](#️-alchemist-golem)
+- [🎣 Fisher Golem](#-fisher-golem)
 - [📦 Courier Golem](#-courier-golem)
 - [How the courier finds its way](#how-the-courier-finds-its-way)
 - [Troubleshooting: the courier won't move](#troubleshooting-the-courier-wont-move)
+- [Asking a golem what's wrong](#asking-a-golem-whats-wrong)
 - [Full config reference](#full-config-reference)
 
 ---
 
 ## Common rules
 
-These apply to all three golems.
+These apply to every golem.
 
-- **Telling them apart.** The **Lava Golem is on fire** (purely visual — it takes no damage) and the **Alchemist trails magic particles**. The Smelter and Courier are plain; the Courier is the one visibly carrying an item. No resource pack is involved.
+- **Telling them apart.** The **Lava Golem is on fire** (purely visual — it takes no damage), the **Alchemist trails magic particles** and the **Fisher holds a fishing rod**. The Smelter and Courier are plain; the Courier is the one visibly carrying an item. No resource pack is involved.
 - **Spawning.** Craft the golem's Heart (recipes below), then right-click the ground with it. Only golems made from these recipes are controlled — vanilla copper golems are left alone.
 - **Menu.** Right-click a golem with an **empty hand** to open its menu (stats, and settings where it has them).
 - **Switching one off.** Every menu has a **power button**: click it and the golem stops on the spot and stays parked until you switch it back on. Handy while you rebuild a station. The setting survives restarts.
@@ -132,6 +134,48 @@ If several allowed ingredients are in the chest at once, it takes the **most abu
 
 ---
 
+## 🎣 Fisher Golem
+
+**Recipe center:** Fishing Rod · **Works with:** a pond + a `[Rods]` container and an `[Output]` container.
+
+**What it does:** takes a rod out of your chest, stands on the bank, casts out over the water and reels the catch in, over and over until the rod breaks — then takes the next one and files the catch away. The catches use vanilla's own fishing weights, so it pulls up exactly what you would.
+
+**How the fishing looks.** It stands on the shore and casts toward the water (it never wades in). A ripple marks where the line is; the wait to a bite is random, the same 5–30 seconds vanilla uses, and now and then a fish gets away — you'll see it reel up nothing and cast again. There is **no real bobber entity** floating on the line: a bobber belongs to a player-owned hook, which a golem doesn't have, so the ripple particle stands in for it.
+
+**Setup:**
+1. **Water** in range — see *open water* below for why the shape of it matters.
+2. A `[Rods]` container with fishing rods in it.
+3. An `[Output]` container for the catch.
+4. *(Optional)* a `[Treasure]` container. Add one and treasure goes there while ordinary fish and junk still go to `[Output]`. Without it, everything lands in `[Output]`.
+
+**The rod is the fuel.** There is no other running cost, and there doesn't need to be. A rod is 64 uses and a catch takes about 17 seconds on average, so **one rod is roughly 18 minutes of fishing**. A fisher that runs around the clock needs a steady supply of rods — which means string and sticks, which means farms. That's the infrastructure you're meant to build.
+
+**Your rod's enchantments are what matter:**
+
+| Enchantment | What it does for the golem |
+|---|---|
+| **Luck of the Sea** | Better catches — more treasure, less junk. Exactly the vanilla weighting. |
+| **Lure** | Shortens the wait by 5 seconds per level. |
+| **Unbreaking** | The rod lasts longer, the usual 1-in-(level+1) saving throw. |
+| **Mending** | **Nothing.** See below. |
+
+> **Mending is dead weight here.** The golem earns no XP — that's the trade for not having to hold the button yourself — so there is nothing to repair a rod with. Rods really do run out. Don't waste a Mending book on one.
+
+**Open water and treasure.** In vanilla, treasure only bites in open water, and the same rule applies here: the golem needs **5×5 of water around its fishing spot with air above it**. A 1×1 hole in your floor will catch fish and junk forever and never yield a single treasure. Dig a real pond. If several bits of water are in range the golem prefers an open-water one, even if a puddle happens to be closer. You can switch treasure off entirely with `fisher-treasure: false`.
+
+**Menu:** the on/off switch, the three container tags, and stats (fish and junk caught, treasure caught, rods used, active since).
+
+**Adding your own catches.** In the config you can drop any item into the catch — a diamond, an emerald, anything — via `fisher-custom-catches`. Each entry joins one pool (fish, junk or treasure) and competes with the vanilla items there by weight, so a rare treasure entry only turns up on the small share of casts that roll treasure. Put it in the treasure pool and it rides the `[Treasure]` routing too. See the config reference below.
+
+**If it just stands there:**
+- No rod in `[Rods]` — or every rod in there is already worn out.
+- No water within `search-radius` (8 blocks by default) — or only a cauldron, which is not a pond and can't be fished.
+- Nowhere to put the catch: it won't fish something up just to stand there holding it, so it waits until `[Output]` (or `[Treasure]`) exists and has room.
+
+> **Note on the loot:** the server API won't run the vanilla fishing tables for a plugin (they require a fishing rod as a parameter that the API can't supply), so the fish/junk/treasure lists and their weights are transcribed into the plugin from the game's own tables — the same way the Alchemist keeps the brewing recipes the API also won't hand over. What you catch, and how often, is vanilla; a brand-new vanilla catch would need a plugin update to appear.
+
+---
+
 ## 📦 Courier Golem
 
 **Recipe center:** Hopper · **Works with:** any two containers you tag, plus optional `[Waypoint]` signs.
@@ -222,6 +266,19 @@ Set `courier-teleport: true` (the default) so it blinks to the target when stuck
 
 ---
 
+## Asking a golem what's wrong
+
+If a golem is standing there and you can't see why, stand within 12 blocks of it and run **`/golemdebug`** (needs `lavagolem.admin`). It latches onto the nearest golem and narrates its decisions in chat — which containers it found, what it decided to do, and where it gave up:
+
+```
+[G] decide mode=BALANCED furnaces=3 smelt=true fuel=false output=true
+[G] step2 STALL: furnace has no fuel and no [Fuel] chest found
+```
+
+Run it again to switch tracing off. It's per-golem and doesn't survive a restart, so it's safe to leave on while you fix the station. Right now it traces the **Smelter's** decision loop — the one with the most moving parts.
+
+---
+
 ## Full config reference
 
 `plugins/LavaGolem/config.yml`:
@@ -237,8 +294,29 @@ bucket-sign-text: "[Buckets]"   # Lava Golem: empty buckets
 lava-sign-text:   "[Lava]"      # Lava Golem: filled lava buckets
 smelt-sign-text:  "[Smelt]"     # Smelter: items to melt
 fuel-sign-text:   "[Fuel]"      # Smelter: any vanilla fuel
-output-sign-text: "[Output]"    # Smelter: finished goods (+ returned buckets); Alchemist: potions
+output-sign-text: "[Output]"    # Smelter: finished goods (+ returned buckets); Alchemist: potions; Fisher: the catch
 brew-sign-text:   "[Brew]"      # Alchemist: bottles + fuel + ingredients, all in one container
+rods-sign-text:   "[Rods]"      # Fisher: fishing rods to work through
+treasure-sign-text: "[Treasure]" # Fisher: optional — treasure goes here instead of [Output]
+
+# --- Fisher only ---
+fisher-min-wait-ticks: 100   # Vanilla's own wait window is 100-600 ticks (5-30s); Lure takes 100 off per level
+fisher-max-wait-ticks: 600
+fisher-treasure: true        # false = fish and junk only, no treasure at all
+# Add your own items to the catch. Each joins ONE pool and competes by weight with the vanilla items
+# there — a treasure entry only appears on the ~5% of casts that roll treasure. Rough pool totals:
+# fish ~100, junk ~100, treasure ~6. Config items are given exactly as written (no wear/enchanting).
+fisher-custom-catches: []
+#  - { material: DIAMOND, weight: 2, amount: 1, pool: treasure }
+#  - { material: EMERALD, weight: 5, amount: 1, pool: junk }
+
+# --- Turn golems on or off (all on by default) ---
+# A disabled golem can't be crafted or placed; any that already exist sit idle until re-enabled.
+enable-lava-golem: true
+enable-smelter-golem: true
+enable-courier-golem: true
+enable-alchemist-golem: true
+enable-fisher-golem: true
 
 # --- Courier only ---
 courier-search-radius: 24    # Same in every direction; must cover BOTH ends of a route. Capped at 32 (cost ~ radius^3)

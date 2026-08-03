@@ -40,6 +40,12 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public NamespacedKey itemsSmeltedKey;
     public NamespacedKey itemsMovedKey;
     public NamespacedKey potionsBrewedKey;
+    public NamespacedKey fishCaughtKey;
+    public NamespacedKey treasureCaughtKey;
+    public NamespacedKey rodsUsedKey;
+    /** Set while the fisher carries a catch that came off the treasure table, so the delivery step
+     *  knows to look for [Treasure] rather than [Output]. */
+    public NamespacedKey treasureFlagKey;
     public NamespacedKey courierRoutesKey;
     public NamespacedKey createdAtKey;
     /** Set when a player has paused this golem from its menu; the ticker then leaves it alone. */
@@ -52,7 +58,7 @@ public final class LavaGolemPlugin extends JavaPlugin {
      * given its own tag from its menu, so two stations of the same kind can sit side by side without
      * fighting over one shared `[Output]`.
      */
-    public enum GolemTag { BUCKETS, LAVA, SMELT, FUEL, OUTPUT, BREW }
+    public enum GolemTag { BUCKETS, LAVA, SMELT, FUEL, OUTPUT, BREW, RODS, TREASURE }
 
     private final Map<GolemTag, NamespacedKey> tagKeys = new java.util.EnumMap<>(GolemTag.class);
 
@@ -65,6 +71,8 @@ public final class LavaGolemPlugin extends JavaPlugin {
             case FUEL -> cfg.fuelSignText;
             case OUTPUT -> cfg.outputSignText;
             case BREW -> cfg.brewSignText;
+            case RODS -> cfg.rodsSignText;
+            case TREASURE -> cfg.treasureSignText;
         };
     }
 
@@ -93,6 +101,17 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public static final String ROLE_SMELTER = "SMELTER";
     public static final String ROLE_COURIER = "COURIER";
     public static final String ROLE_ALCHEMIST = "ALCHEMIST";
+    public static final String ROLE_FISHER = "FISHER";
+
+    /** Whether a role is switched on in the config. A disabled role can't be crafted or spawned, and
+     *  any golems of that role already in the world sit inert until it's switched back on. */
+    public boolean isRoleEnabled(String role) {
+        if (ROLE_SMELTER.equals(role)) return cfg.enableSmelter;
+        if (ROLE_COURIER.equals(role)) return cfg.enableCourier;
+        if (ROLE_ALCHEMIST.equals(role)) return cfg.enableAlchemist;
+        if (ROLE_FISHER.equals(role)) return cfg.enableFisher;
+        return cfg.enableLava; // hauler / default
+    }
 
     /** Smelter work modes (configurable per-golem via its GUI). */
     public static final String MODE_BALANCED = "BALANCED";
@@ -101,6 +120,9 @@ public final class LavaGolemPlugin extends JavaPlugin {
 
     /** UUIDs of golems whose vanilla AI has already been cleaned up in this session. */
     public final Set<UUID> cleanedUpGolems = ConcurrentHashMap.newKeySet();
+
+    /** golem UUID -> watching player UUID, for /golemdebug live decision tracing. Transient. */
+    public final Map<UUID, UUID> debugWatchers = new ConcurrentHashMap<>();
 
     /** Valid inputs per furnace kind, discovered from recipes at startup.
      *  smeltableInputs (regular furnace) is a superset of the other two in vanilla. */
@@ -161,6 +183,10 @@ public final class LavaGolemPlugin extends JavaPlugin {
         itemsSmeltedKey  = new NamespacedKey(this, "items_smelted");
         itemsMovedKey    = new NamespacedKey(this, "items_moved");
         potionsBrewedKey = new NamespacedKey(this, "potions_brewed");
+        fishCaughtKey    = new NamespacedKey(this, "fish_caught");
+        treasureCaughtKey = new NamespacedKey(this, "treasure_caught");
+        rodsUsedKey      = new NamespacedKey(this, "rods_used");
+        treasureFlagKey  = new NamespacedKey(this, "carrying_treasure");
         pausedKey        = new NamespacedKey(this, "paused");
         alchemyDisabledKey = new NamespacedKey(this, "alchemy_disabled");
         for (GolemTag t : GolemTag.values()) {
@@ -174,10 +200,12 @@ public final class LavaGolemPlugin extends JavaPlugin {
         }
 
         buildSmeltableInputs();
-        registerHeartRecipe();
-        registerSmelterHeartRecipe();
-        registerCourierHeartRecipe();
-        registerAlchemistHeartRecipe();
+        // Only register a role's recipe if it's enabled — a disabled golem can't be crafted.
+        if (cfg.enableLava) registerHeartRecipe();
+        if (cfg.enableSmelter) registerSmelterHeartRecipe();
+        if (cfg.enableCourier) registerCourierHeartRecipe();
+        if (cfg.enableAlchemist) registerAlchemistHeartRecipe();
+        if (cfg.enableFisher) registerFisherHeartRecipe();
         golemMenu = new GolemMenu(this);
         courierMenu = new CourierMenu(this);
         alchemistMenu = new AlchemistMenu(this);
@@ -203,11 +231,35 @@ public final class LavaGolemPlugin extends JavaPlugin {
             return true;
         });
 
+        getCommand("golemdebug").setExecutor((sender, command, label, args) -> {
+            if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("In-game only."); return true; }
+            Mob nearest = null;
+            double best = Double.MAX_VALUE;
+            for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
+                if (!(e instanceof Mob m)) continue;
+                if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                double d = e.getLocation().distanceSquared(p.getLocation());
+                if (d < best) { best = d; nearest = m; }
+            }
+            if (nearest == null) {
+                p.sendMessage(Component.text("No golem within 12 blocks.", NamedTextColor.RED));
+                return true;
+            }
+            if (debugWatchers.remove(nearest.getUniqueId()) != null) {
+                p.sendMessage(Component.text("Debug OFF for the nearest golem.", NamedTextColor.YELLOW));
+            } else {
+                debugWatchers.put(nearest.getUniqueId(), p.getUniqueId());
+                p.sendMessage(Component.text("Debug ON for the nearest golem — watch chat.", NamedTextColor.GREEN));
+            }
+            return true;
+        });
+
         getCommand("golemstats").setExecutor((sender, command, label, args) -> {
             int golems = 0;
             int totalLava = 0;
             int totalBuckets = 0;
             int totalSmelted = 0;
+            int totalCaught = 0;
             for (World world : Bukkit.getWorlds()) {
                 for (Entity entity : world.getEntitiesByClass(Mob.class)) {
                     if (!entity.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
@@ -218,6 +270,10 @@ public final class LavaGolemPlugin extends JavaPlugin {
                             .getOrDefault(bucketsTakenKey, PersistentDataType.INTEGER, 0);
                     totalSmelted += entity.getPersistentDataContainer()
                             .getOrDefault(itemsSmeltedKey, PersistentDataType.INTEGER, 0);
+                    totalCaught += entity.getPersistentDataContainer()
+                            .getOrDefault(fishCaughtKey, PersistentDataType.INTEGER, 0)
+                            + entity.getPersistentDataContainer()
+                            .getOrDefault(treasureCaughtKey, PersistentDataType.INTEGER, 0);
                 }
             }
             sender.sendMessage(Component.text()
@@ -234,6 +290,9 @@ public final class LavaGolemPlugin extends JavaPlugin {
                     .append(Component.newline())
                     .append(Component.text(msg.get("total-smelted"), NamedTextColor.GRAY))
                     .append(Component.text(totalSmelted, NamedTextColor.WHITE))
+                    .append(Component.newline())
+                    .append(Component.text(msg.get("total-caught"), NamedTextColor.GRAY))
+                    .append(Component.text(totalCaught, NamedTextColor.WHITE))
                     .build());
             return true;
         });
@@ -246,9 +305,13 @@ public final class LavaGolemPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        // Every recipe we add must be removed here, or a /reload leaves the old one registered and
+        // addRecipe rejects the new one as a duplicate key — the heart then silently stops crafting.
         Bukkit.removeRecipe(new NamespacedKey(this, "golem_heart_recipe"));
         Bukkit.removeRecipe(new NamespacedKey(this, "smelter_heart_recipe"));
         Bukkit.removeRecipe(new NamespacedKey(this, "courier_heart_recipe"));
+        Bukkit.removeRecipe(new NamespacedKey(this, "alchemist_heart_recipe"));
+        Bukkit.removeRecipe(new NamespacedKey(this, "fisher_heart_recipe"));
     }
 
     /** Builds the sets of valid inputs per furnace kind (regular / blast / smoker). */
@@ -328,6 +391,7 @@ public final class LavaGolemPlugin extends JavaPlugin {
         String prefix = ROLE_SMELTER.equals(role) ? "smelter-heart"
                 : ROLE_COURIER.equals(role) ? "courier-heart"
                 : ROLE_ALCHEMIST.equals(role) ? "alchemist-heart"
+                : ROLE_FISHER.equals(role) ? "fisher-heart"
                 : "heart";
         ItemStack item = new ItemStack(Material.COPPER_GOLEM_SPAWN_EGG);
         ItemMeta meta = item.getItemMeta();
@@ -394,6 +458,19 @@ public final class LavaGolemPlugin extends JavaPlugin {
         recipe.setIngredient('C', Material.COPPER_INGOT);
         recipe.setIngredient('R', Material.REDSTONE);
         recipe.setIngredient('L', Material.BREWING_STAND);
+        Bukkit.addRecipe(recipe);
+    }
+
+    private void registerFisherHeartRecipe() {
+        ShapedRecipe recipe = new ShapedRecipe(
+                new NamespacedKey(this, "fisher_heart_recipe"),
+                createGolemHeart(ROLE_FISHER)
+        );
+        // Pattern: CRC / RLR / CRC (copper corners, redstone cross, fishing rod center)
+        recipe.shape("CRC", "RLR", "CRC");
+        recipe.setIngredient('C', Material.COPPER_INGOT);
+        recipe.setIngredient('R', Material.REDSTONE);
+        recipe.setIngredient('L', Material.FISHING_ROD);
         Bukkit.addRecipe(recipe);
     }
 }

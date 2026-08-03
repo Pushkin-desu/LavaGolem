@@ -1,6 +1,6 @@
 # LavaGolem
 
-A Paper plugin for Minecraft 1.21 that adds four automated Copper Golems: one hauls lava from cauldrons, one keeps your furnaces running, one runs your brewing stands, and one carries items between your storage.
+A Paper plugin for Minecraft 1.21 that adds five automated Copper Golems: one hauls lava from cauldrons, one keeps your furnaces running, one runs your brewing stands, one fishes your pond, and one carries items between your storage.
 
 [README на русском](README_RU.md) · [Full guide & troubleshooting](GUIDE.md)
 
@@ -32,6 +32,14 @@ Runs your brewing stands — no dropper-and-hopper brewery.
 - **Keeps only one blaze powder as fuel** (a single pinch is 20 brews), leaving the rest available for Strength potions.
 - **Grinds blaze rods** into powder at a crafting table, using the real vanilla recipe.
 
+### 🎣 Fisher Golem
+Fishes your pond for you, on vanilla's own fishing weights.
+
+- **Works through your rods** — takes one from `[Rods]`, fishes until it breaks, takes the next. The rod *is* the running cost: ~64 catches, about 18 minutes each.
+- **Your rod's enchantments matter** — Luck of the Sea improves the catch, Lure shortens the wait, Unbreaking makes it last. **Mending does nothing**: the golem earns no XP, so rods genuinely run out.
+- **Treasure needs open water**, exactly as in vanilla — 5×5 of water with air above. A 1×1 hole catches fish and junk forever and no treasure.
+- **Sorts the catch** — add an optional `[Treasure]` container and treasure goes there while fish and junk go to `[Output]`.
+
 ### 📦 Courier Golem
 Carries items between tagged containers along routes you set in its GUI.
 
@@ -42,7 +50,7 @@ Carries items between tagged containers along routes you set in its GUI.
 
 ## Recipes
 
-All four share the same shape — only the center changes:
+All five share the same shape — only the center changes:
 
 ```
 C R C        C = Copper Ingot
@@ -55,6 +63,7 @@ C R C
 | Lava Golem | Lava Bucket |
 | Smelter Golem | Furnace |
 | Alchemist Golem | Brewing Stand |
+| Fisher Golem | Fishing Rod |
 | Courier Golem | Hopper |
 
 The result is a **Golem Heart**. Right-click the ground with it to place the golem.
@@ -71,15 +80,17 @@ Storage can be a **chest, trapped chest, barrel or shulker box**. Tag it either 
 | `[Lava]` | Lava Golem — filled lava buckets |
 | `[Smelt]` | Smelter — items to melt |
 | `[Fuel]` | Smelter — any vanilla fuel |
-| `[Output]` | Smelter — finished goods (spent buckets return here too); Alchemist — potions |
+| `[Output]` | Smelter — finished goods (spent buckets return here too); Alchemist — potions; Fisher — the catch |
 | `[Brew]` | Alchemist — bottles, fuel and ingredients, all in one |
+| `[Rods]` | Fisher — fishing rods to work through |
+| `[Treasure]` | Fisher — optional; treasure lands here instead of `[Output]` |
 | *anything* | Courier — routes use whatever tags you type |
 
 These are only the **defaults**. In any golem's menu, right-click a container slot to give *that golem* its own tag (left-click resets it), so two stations of the same kind can stand side by side without sharing an `[Output]`.
 
 ## Everyday use
 
-- **Telling them apart** — the Lava Golem is on fire (visual only, it takes no damage) and the Alchemist trails magic particles. No resource pack.
+- **Telling them apart** — the Lava Golem is on fire (visual only, it takes no damage), the Alchemist trails magic particles, and the Fisher holds a rod. No resource pack.
 - **Stats / settings** — right-click a golem with an empty hand to open its menu.
 - **Switching one off** — every menu has a power button; the golem stops where it stands until you switch it back on.
 - **Disassemble** — sneak + right-click with an empty hand; the Heart drops back along with anything the golem carried.
@@ -91,6 +102,7 @@ These are only the **defaults**. In any golem's menu, right-click a container sl
 |---------|-----------|-------------|
 | `/removegolems` | `lavagolem.admin` | Remove all custom golems |
 | `/golemstats`   | `lavagolem.admin` | Show aggregate statistics |
+| `/golemdebug`   | `lavagolem.admin` | Toggle live decision tracing for the nearest golem (within 12 blocks) — it reports in chat why it isn't working |
 
 ## Configuration
 
@@ -107,6 +119,20 @@ smelt-sign-text: "[Smelt]"
 fuel-sign-text: "[Fuel]"
 output-sign-text: "[Output]"
 brew-sign-text: "[Brew]"  # Alchemist: bottles + fuel + ingredients in one container
+rods-sign-text: "[Rods]"  # Fisher: fishing rods to work through
+treasure-sign-text: "[Treasure]" # Fisher: optional, treasure goes here instead of [Output]
+
+fisher-min-wait-ticks: 100 # Fisher only: vanilla's wait window is 100-600 ticks; Lure takes 100 off per level
+fisher-max-wait-ticks: 600
+fisher-treasure: true     # false = fish and junk only
+fisher-custom-catches: [] # add your own items to the catch — see below
+
+# Turn golems on or off (all on by default). A disabled golem can't be crafted or placed.
+enable-lava-golem: true
+enable-smelter-golem: true
+enable-courier-golem: true
+enable-alchemist-golem: true
+enable-fisher-golem: true
 
 courier-search-radius: 24 # Courier only: same in every direction, must cover both ends of a route (max 32)
 courier-carry-limit: 16   # Items a courier carries per trip
@@ -120,6 +146,16 @@ bstats: true              # Anonymous usage stats
 
 The courier scans a cube, so its cost grows as radius³ — keep `courier-search-radius` only as big as your routes need.
 
+**Custom catches.** Add any item to the fisher's catch with `fisher-custom-catches`. Each entry joins one pool and competes with the vanilla items there by weight:
+
+```yaml
+fisher-custom-catches:
+  - { material: DIAMOND, weight: 2, amount: 1, pool: treasure }
+  - { material: EMERALD, weight: 5, amount: 1, pool: junk }
+```
+
+`pool` is `fish`, `junk` or `treasure`; a `treasure` entry only appears on the ~5% of casts that roll treasure and rides the `[Treasure]` routing. Pool weight totals are roughly: fish ~100, junk ~100, treasure ~6. Config items are handed over exactly as written (no vanilla wear or enchanting).
+
 ## Building
 
 Requires Java 21 and Maven 3.x.
@@ -128,7 +164,7 @@ Requires Java 21 and Maven 3.x.
 mvn clean package
 ```
 
-The plugin jar will be at `target/lavagolem-1.0.3.jar`.
+The plugin jar will be at `target/lavagolem-1.0.4.jar`.
 
 ## License
 
