@@ -15,6 +15,7 @@ public class PluginConfig {
     public final int searchRadius;
     public final double reachDistance;
     public final long searchCooldownTicks;
+    public final long golemStuckTicks;
     public final long tickPeriod;
     public final String bucketSignText;
     public final String lavaSignText;
@@ -44,9 +45,19 @@ public class PluginConfig {
     public PluginConfig(LavaGolemPlugin plugin) {
         plugin.saveDefaultConfig();
         var c = plugin.getConfig();
-        this.searchRadius        = c.getInt("search-radius", 8);
+        // The hauler/smelter/alchemist/fisher search is a cube scan too — same O(radius^3) cost as
+        // the courier's, so it gets the same 1..32 clamp rather than trusting an admin-set value.
+        int rawSearchRadius = c.getInt("search-radius", 8);
+        this.searchRadius        = Math.max(1, Math.min(32, rawSearchRadius));
+        if (rawSearchRadius != this.searchRadius) {
+            plugin.getLogger().warning("search-radius " + rawSearchRadius + " is out of range (1-32), using "
+                    + this.searchRadius + " instead.");
+        }
         this.reachDistance       = c.getDouble("reach-distance", 2.2);
         this.searchCooldownTicks = c.getLong("search-cooldown-ticks", 40);
+        // Logic ticks (each tick-period game ticks) with no real progress toward a target before a
+        // golem gives up on it and goes back to idle, rather than shoving into the same wall forever.
+        this.golemStuckTicks     = Math.max(5, c.getLong("golem-stuck-ticks", 30));
         this.tickPeriod          = c.getLong("tick-period", 10);
         this.bucketSignText      = c.getString("bucket-sign-text", "[Buckets]");
         this.lavaSignText        = c.getString("lava-sign-text", "[Lava]");

@@ -1,6 +1,7 @@
 # LavaGolem configuration
 
-# Search radius for chests and cauldrons (in blocks)
+# Search radius for chests and cauldrons (in blocks). The scan is a cube, so cost grows as
+# radius^3 — clamped to 1-32 for the same reason as the courier's search radius below.
 search-radius: 8
 
 # Distance at which the golem considers it has reached its target
@@ -11,6 +12,12 @@ search-cooldown-ticks: 40
 
 # Golem logic tick period (10 = every 0.5 seconds)
 tick-period: 10
+
+# Logic ticks (each worth tick-period game ticks) a golem will keep trying to reach a target with
+# no real progress before it gives up and goes back to looking for something else — the fix for a
+# golem that's found a job but boxed itself in and would otherwise push against the same wall
+# forever. At the default tick-period that's ~15 seconds. Minimum 5.
+golem-stuck-ticks: 30
 
 # How to tag a storage container (chest, trapped chest, barrel or shulker box):
 #   - place a sign with the matching text on any of its 6 faces, OR

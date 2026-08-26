@@ -14,7 +14,6 @@ import org.bukkit.block.Container;
 import org.bukkit.block.Furnace;
 import org.bukkit.block.Sign;
 import org.bukkit.entity.CopperGolem;
-import org.bukkit.entity.Entity;
 import org.bukkit.entity.Mob;
 import org.bukkit.inventory.FurnaceInventory;
 import org.bukkit.inventory.Inventory;
@@ -58,6 +57,18 @@ public class GolemTicker extends BukkitRunnable {
     /** Transient per-courier navigation state: which waypoints it has already passed this leg. */
     private final Map<java.util.UUID, java.util.Set<Long>> courierVisited = new HashMap<>();
 
+    /** Same idea as courierStuck, but for the non-courier roles, which give up on the target instead
+     *  of teleporting toward it (see noProgress). Same shape: uuid -> {stallLogicTicks, lastDistance}. */
+    private final Map<java.util.UUID, double[]> stuckProgress = new HashMap<>();
+
+    /** Last System.currentTimeMillis() a tick-crash was logged for a golem, so one wedged golem that
+     *  throws every tick doesn't spam the console — see run(). */
+    private final Map<java.util.UUID, Long> lastErrorLog = new HashMap<>();
+
+    /** Why a golem most recently gave up its search — feeds /golemdebug's live trace. Nothing else
+     *  reads this yet; it exists as a foundation for future diagnostics. */
+    private final Map<java.util.UUID, String> lastProblem = new HashMap<>();
+
     /** Fuel capacity in "furnace item slots" per fuel unit (burn_ticks / 200), hardcoded per spec. */
     private static final Map<Material, Integer> FUEL_CAPACITY = new HashMap<>();
     static {
@@ -89,18 +100,65 @@ public class GolemTicker extends BukkitRunnable {
     public void run() {
         tickCount++;
         for (World world : Bukkit.getWorlds()) {
-            for (Entity entity : world.getEntitiesByClass(Mob.class)) {
-                Mob golem = (Mob) entity;
+            // Golems are always copper golems, so scanning that narrower type instead of Mob skips a
+            // PDC lookup for every other mob in the world (players' zombies, farm animals, and so on).
+            // The PDC check below stays the authoritative filter — it's what tells ours apart from a
+            // plain vanilla copper golem, which this class would otherwise also match.
+            for (CopperGolem golem : world.getEntitiesByClass(CopperGolem.class)) {
                 if (golem.getPersistentDataContainer()
                         .get(plugin.golemEntityKey, PersistentDataType.BYTE) == null) continue;
 
                 // Reset weathering state every ~5 seconds
-                if (tickCount % 10 == 0 && golem instanceof CopperGolem cg) {
-                    cg.setWeatheringState(WeatheringCopperState.UNAFFECTED);
+                if (tickCount % 10 == 0) {
+                    golem.setWeatheringState(WeatheringCopperState.UNAFFECTED);
                 }
 
-                tickGolem(golem);
+                try {
+                    tickGolem(golem);
+                } catch (Throwable t) {
+                    // A single misbehaving golem (a corrupt PDC, a station torn down mid-job) must never
+                    // abort the tick for every other golem on the server. Rate-limited per golem so one
+                    // stuck in a throwing loop doesn't flood the console twice a second.
+                    java.util.UUID id = golem.getUniqueId();
+                    long now = System.currentTimeMillis();
+                    Long last = lastErrorLog.get(id);
+                    if (last == null || now - last >= 60_000L) {
+                        lastErrorLog.put(id, now);
+                        String role = golem.getPersistentDataContainer().getOrDefault(
+                                plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
+                        plugin.getLogger().warning("[LG] Golem " + id + " (role=" + role
+                                + ") threw during its tick; recovering it to idle: " + t);
+                    }
+                    abortForCrash(golem);
+                }
             }
+        }
+    }
+
+    /** Best-effort recovery once tickGolem has thrown: whatever broke, the golem must not stay wedged
+     *  on a half-finished job forever. Reuses each role's own abort helper where one exists; the hauler
+     *  and smelter have none, so their job state is unwound directly to the equivalent idle state. */
+    private void abortForCrash(Mob golem) {
+        try {
+            String role = golem.getPersistentDataContainer().getOrDefault(
+                    plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
+            stuckProgress.remove(golem.getUniqueId());
+            if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) {
+                clearTarget(golem);
+                setSmelterState(golem, "SMELTER_IDLE");
+            } else if (LavaGolemPlugin.ROLE_COURIER.equals(role)) {
+                abortCourier(golem);
+            } else if (LavaGolemPlugin.ROLE_ALCHEMIST.equals(role)) {
+                abortAlchemy(golem);
+            } else if (LavaGolemPlugin.ROLE_FISHER.equals(role)) {
+                abortFisher(golem);
+            } else {
+                clearTarget(golem);
+                setState(golem, "SEEKING_BUCKET");
+            }
+        } catch (Throwable ignored) {
+            // The recovery path touches the same PDC that just misbehaved; if it throws too, there's
+            // nothing more we can safely do this tick — the golem just sits until the next one.
         }
     }
 
@@ -179,6 +237,22 @@ public class GolemTicker extends BukkitRunnable {
                 net.kyori.adventure.text.format.NamedTextColor.AQUA));
     }
 
+    /** Why this golem last gave up its search — "stuck", "no [Lava] container in range", and so on.
+     *  Nothing consumes this yet besides gdebug's own trace; it exists so a future diagnostic (or a
+     *  GUI tooltip) has somewhere ready-made to read from. */
+    public String lastProblem(Mob golem) {
+        return lastProblem.get(golem.getUniqueId());
+    }
+
+    private void setLastProblem(Mob golem, String reason) {
+        lastProblem.put(golem.getUniqueId(), reason);
+        if (isDebug(golem)) gdebug(golem, "idle: " + reason);
+    }
+
+    private void clearLastProblem(Mob golem) {
+        lastProblem.remove(golem.getUniqueId());
+    }
+
     /** Core decision engine: picks the single best action for an idle smelter golem. */
     private void smelterDecide(Mob golem) {
         if (!canSearch(golem)) return;
@@ -193,10 +267,13 @@ public class GolemTicker extends BukkitRunnable {
             Block dest = findTaggedContainer(origin, plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT), false);
             if (dest == null) dest = findTaggedContainer(origin, plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BUCKETS), false);
             if (dest != null) {
+                clearLastProblem(golem);
                 clearSearchCooldown(golem);
                 setTarget(golem, dest.getLocation());
                 setSmelterState(golem, "SMELTER_TO_OUTPUT");
             } else {
+                setLastProblem(golem, "no " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT)
+                        + " or " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BUCKETS) + " to hold its carried item");
                 delayNextSearch(golem); // nowhere to put it yet — hold and wait
             }
             return;
@@ -204,7 +281,7 @@ public class GolemTicker extends BukkitRunnable {
 
         StationScan scan = scanStation(golem, origin);
         List<Block> furnaces = scan.furnaces;
-        if (furnaces.isEmpty()) { if (dbg) gdebug(golem, "idle: no furnaces in range"); delayNextSearch(golem); return; }
+        if (furnaces.isEmpty()) { setLastProblem(golem, "no furnaces in range"); delayNextSearch(golem); return; }
 
         Block outputChest = scan.outputChest;
         Block smeltChest = scan.smeltChest;
@@ -248,6 +325,7 @@ public class GolemTicker extends BukkitRunnable {
                 if (d < bestDist) { bestDist = d; bestRetrieve = f; }
             }
             if (bestRetrieve != null) {
+                clearLastProblem(golem);
                 clearSearchCooldown(golem);
                 setJobFurnace(golem, bestRetrieve.getLocation());
                 setTarget(golem, bestRetrieve.getLocation());
@@ -315,7 +393,12 @@ public class GolemTicker extends BukkitRunnable {
                         int cap = fuelCapacity(existingFuel.getType());
                         int capRem = cap * existingFuel.getAmount();
                         n = Math.min(Math.min(share, capRem), 64);
-                        if (n <= 0) { delayNextSearch(golem); return; }
+                        if (n <= 0) {
+                            setLastProblem(golem, "furnace's existing fuel has no capacity left for more input");
+                            delayNextSearch(golem);
+                            return;
+                        }
+                        clearLastProblem(golem);
                         clearSearchCooldown(golem);
                         setJobFurnace(golem, bestFurnace.getLocation());
                         setJobAmount(golem, n);
@@ -333,6 +416,7 @@ public class GolemTicker extends BukkitRunnable {
                         if (dbg) gdebug(golem, "step2 furnace ok, batch=" + n + " material=" + bestMaterial
                                 + " chosenFuel=" + chosenFuel);
                         if (chosenFuel != null) {
+                            clearLastProblem(golem);
                             clearSearchCooldown(golem);
                             setJobFurnace(golem, bestFurnace.getLocation());
                             setJobAmount(golem, n);
@@ -372,6 +456,7 @@ public class GolemTicker extends BukkitRunnable {
                 if (chosenFuel != null) {
                     int cap = fuelCapacity(chosenFuel);
                     int units = Math.max(1, (int) Math.ceil(itemsInInput / (double) cap));
+                    clearLastProblem(golem);
                     clearSearchCooldown(golem);
                     setJobFurnace(golem, bestFurnace.getLocation());
                     setJobAmount(golem, units);
@@ -392,7 +477,7 @@ public class GolemTicker extends BukkitRunnable {
         }
 
         // 5) Nothing to do
-        if (dbg) gdebug(golem, "idle: nothing to do this cycle");
+        setLastProblem(golem, "nothing to do this cycle");
         delayNextSearch(golem);
     }
 
@@ -421,6 +506,7 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void startCollect(Mob golem, Block furnace) {
+        clearLastProblem(golem);
         clearSearchCooldown(golem);
         setJobFurnace(golem, furnace.getLocation());
         setTarget(golem, furnace.getLocation());
@@ -864,6 +950,7 @@ public class GolemTicker extends BukkitRunnable {
 
     private void moveToTargetSmelter(Mob golem, ReachCallback onReach) {
         Location target = getTarget(golem);
+        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
         if (target == null) {
             clearSearchCooldown(golem);
             setSmelterState(golem, "SMELTER_IDLE");
@@ -871,9 +958,18 @@ public class GolemTicker extends BukkitRunnable {
         }
         double dist = golem.getLocation().distance(target);
         if (dist <= plugin.cfg.reachDistance) {
+            stuckProgress.remove(golem.getUniqueId());
             Block block = target.getBlock();
             clearTarget(golem);
             onReach.onReach(golem, block);
+        } else if (noProgress(golem, target)) {
+            // Genuinely wedged against something (a wall, a step it can't climb) rather than merely
+            // en route — give up on this target exactly as if the search had found nothing at all.
+            stuckProgress.remove(golem.getUniqueId());
+            clearTarget(golem);
+            setLastProblem(golem, "stuck");
+            delayNextSearch(golem);
+            setSmelterState(golem, "SMELTER_IDLE");
         } else {
             golem.getPathfinder().moveTo(target, 1.0);
         }
@@ -998,10 +1094,12 @@ public class GolemTicker extends BukkitRunnable {
             Block dest = findTaggedContainer(origin, first, false);
             if (dest == null) dest = findTaggedContainer(origin, second, false);
             if (dest != null) {
+                clearLastProblem(golem);
                 clearSearchCooldown(golem);
                 setTarget(golem, dest.getLocation());
                 setAlchemistState(golem, "ALCHEMIST_TO_OUTPUT");
             } else {
+                setLastProblem(golem, "no " + outTag + " or " + brewTag + " to hold its carried item");
                 delayNextSearch(golem);
             }
             return;
@@ -1010,6 +1108,8 @@ public class GolemTicker extends BukkitRunnable {
         AlchemyScan scan = scanAlchemyStation(golem, origin);
         if (scan.stands.isEmpty() || scan.brewChest == null
                 || !(scan.brewChest.getState() instanceof Container brew)) {
+            setLastProblem(golem, "no brewing stand or " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BREW)
+                    + " container in range");
             delayNextSearch(golem);
             return;
         }
@@ -1021,6 +1121,7 @@ public class GolemTicker extends BukkitRunnable {
         if (scan.craftingTable != null
                 && !containsMaterial(brew, Material.BLAZE_POWDER)
                 && containsMaterial(brew, Material.BLAZE_ROD)) {
+            clearLastProblem(golem);
             clearSearchCooldown(golem);
             clearJobFurnace(golem);
             setJobMaterial(golem, Material.BLAZE_ROD);
@@ -1066,6 +1167,7 @@ public class GolemTicker extends BukkitRunnable {
             //    half-collected one — leaving finished potions stranded and mixing two batches.
             if (collectableBottleSlot(golem, inv, brew) >= 0) {
                 if (canDeliver) {
+                    clearLastProblem(golem);
                     clearSearchCooldown(golem);
                     setJobFurnace(golem, standBlock.getLocation());
                     setTarget(golem, standBlock.getLocation());
@@ -1123,11 +1225,13 @@ public class GolemTicker extends BukkitRunnable {
                 return;
             }
         }
+        setLastProblem(golem, "nothing to do this cycle");
         delayNextSearch(golem);
     }
 
     /** Sends the golem to the [Brew] chest to pick up {@code material} for {@code stand}. */
     private void startAlchemyFetch(Mob golem, Block stand, String job, Material material, AlchemyScan scan) {
+        clearLastProblem(golem);
         clearSearchCooldown(golem);
         setJobFurnace(golem, stand.getLocation());
         setJobMaterial(golem, material);
@@ -1668,6 +1772,7 @@ public class GolemTicker extends BukkitRunnable {
 
     private void moveToTargetAlchemist(Mob golem, ReachCallback onReach) {
         Location target = getTarget(golem);
+        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
         if (target == null) {
             clearSearchCooldown(golem);
             setAlchemistState(golem, "ALCHEMIST_IDLE");
@@ -1676,9 +1781,19 @@ public class GolemTicker extends BukkitRunnable {
         // Centre-based reach (as for the courier): stands and containers are solid blocks the golem
         // can never stand on, so corner-distance would read short of a golem standing right at them.
         if (reachDist(golem.getLocation(), target) <= plugin.cfg.reachDistance) {
+            stuckProgress.remove(golem.getUniqueId());
             Block block = target.getBlock();
             clearTarget(golem);
             onReach.onReach(golem, block);
+        } else if (noProgress(golem, target)) {
+            // This method also drives the fisher's chest legs (FISHER_TO_RODS/TO_OUTPUT); setting
+            // ALCHEMIST_IDLE here is safe for both — a fisher's own tick switch falls back to
+            // FISHER_IDLE on any state it doesn't recognise, exactly as it already does for a null target.
+            stuckProgress.remove(golem.getUniqueId());
+            clearTarget(golem);
+            setLastProblem(golem, "stuck");
+            delayNextSearch(golem);
+            setAlchemistState(golem, "ALCHEMIST_IDLE");
         } else {
             golem.getPathfinder().moveTo(target, 1.0);
         }
@@ -1694,6 +1809,7 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void abortAlchemy(Mob golem) {
+        stuckProgress.remove(golem.getUniqueId());
         clearAlchemyJob(golem);
         clearTarget(golem);
         delayNextSearch(golem);
@@ -1740,7 +1856,13 @@ public class GolemTicker extends BukkitRunnable {
         if (carried != null && carried.getType() != Material.AIR) {
             Block dest = isTreasure(golem) && scan.treasureChest != null
                     ? scan.treasureChest : scan.outputChest;
-            if (dest == null || !hasRoomFor(dest, carried)) { delayNextSearch(golem); return; }
+            if (dest == null || !hasRoomFor(dest, carried)) {
+                setLastProblem(golem, "no room in " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT)
+                        + " for its catch");
+                delayNextSearch(golem);
+                return;
+            }
+            clearLastProblem(golem);
             setTarget(golem, dest.getLocation());
             setFisherState(golem, "FISHER_TO_OUTPUT");
             return;
@@ -1750,9 +1872,11 @@ public class GolemTicker extends BukkitRunnable {
         if (rodOf(golem) == null) {
             if (scan.rodsChest == null || !(scan.rodsChest.getState() instanceof Container c)
                     || takeableRodSlot(c) < 0) {
+                setLastProblem(golem, "no usable rod in " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.RODS));
                 delayNextSearch(golem);
                 return;
             }
+            clearLastProblem(golem);
             setTarget(golem, scan.rodsChest.getLocation());
             setFisherState(golem, "FISHER_TO_RODS");
             return;
@@ -1760,11 +1884,16 @@ public class GolemTicker extends BukkitRunnable {
 
         // 3) Rod in hand: go fish. Refuse to start with nowhere to put the catch, rather than
         //    fishing something up and then standing there holding it.
-        if (scan.water == null) { delayNextSearch(golem); return; }
-        if (scan.outputChest == null && scan.treasureChest == null) { delayNextSearch(golem); return; }
+        if (scan.water == null) { setLastProblem(golem, "no fishable water in range"); delayNextSearch(golem); return; }
+        if (scan.outputChest == null && scan.treasureChest == null) {
+            setLastProblem(golem, "no " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.OUTPUT) + " container in range");
+            delayNextSearch(golem);
+            return;
+        }
         // Stand on the bank and cast out to the (open) water, the way a player does. If the pond has no
         // walkable bank in range we hold rather than wade in — never send the golem into the water.
-        if (scan.shore == null) { delayNextSearch(golem); return; }
+        if (scan.shore == null) { setLastProblem(golem, "no walkable bank beside the water"); delayNextSearch(golem); return; }
+        clearLastProblem(golem);
         setJobFurnace(golem, scan.water.getLocation()); // the cast point
         setTarget(golem, scan.shore);                   // where to stand
         setFisherState(golem, "FISHER_TO_WATER");
@@ -1774,10 +1903,20 @@ public class GolemTicker extends BukkitRunnable {
      *  ends up on land rather than stopping a couple of blocks short in the water). */
     private void moveToFisherShore(Mob golem) {
         Location target = getTarget(golem);
+        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
         if (target == null) { clearSearchCooldown(golem); setFisherState(golem, "FISHER_IDLE"); return; }
         if (golem.getLocation().distance(target) <= 1.3) {
+            stuckProgress.remove(golem.getUniqueId());
             clearTarget(golem);
             onReachFishingSpot(golem);
+        } else if (noProgress(golem, target)) {
+            // No walkable bank actually reaches this cast point (a ledge too high, a wall in the way)
+            // — give up and let fisherDecide pick a fresh spot rather than shove at the water forever.
+            stuckProgress.remove(golem.getUniqueId());
+            clearTarget(golem);
+            setLastProblem(golem, "stuck");
+            delayNextSearch(golem);
+            setFisherState(golem, "FISHER_IDLE");
         } else {
             golem.getPathfinder().moveTo(target, 1.0);
         }
@@ -2269,6 +2408,7 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void abortFisher(Mob golem) {
+        stuckProgress.remove(golem.getUniqueId());
         clearJobFurnace(golem);
         clearTarget(golem);
         golem.getPersistentDataContainer().remove(biteTickKey);
@@ -2438,6 +2578,10 @@ public class GolemTicker extends BukkitRunnable {
         Location hop = getTarget(golem);
         Location fin = getCourierFinal(golem);
         if (fin == null) fin = hop;
+        // Cross-world guard (consistency with the other movement methods): a hop/final left over from
+        // before a portal trip or a world reload can't be measured against the golem's own world.
+        if (hop != null && wrongWorld(golem, hop)) hop = null;
+        if (fin != null && wrongWorld(golem, fin)) fin = null;
         if (hop == null || fin == null) {
             courierStuck.remove(golem.getUniqueId());
             courierVisited.remove(golem.getUniqueId());
@@ -2564,13 +2708,7 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private Location getCourierFinal(Mob golem) {
-        String s = golem.getPersistentDataContainer().get(courierFinalKey, PersistentDataType.STRING);
-        if (s == null) return null;
-        String[] p = s.split(",");
-        if (p.length != 4) return null;
-        World w = Bukkit.getWorld(p[0]);
-        if (w == null) return null;
-        return new Location(w, Integer.parseInt(p[1]) + 0.5, Integer.parseInt(p[2]), Integer.parseInt(p[3]) + 0.5);
+        return parseLoc(golem.getPersistentDataContainer().get(courierFinalKey, PersistentDataType.STRING));
     }
 
     /** Distance from {@code from} to the CENTER of the block {@code blockLoc} points at. Normalises a
@@ -2581,6 +2719,30 @@ public class GolemTicker extends BukkitRunnable {
         double dy = from.getY() - (blockLoc.getBlockY() + 0.5);
         double dz = from.getZ() - (blockLoc.getBlockZ() + 0.5);
         return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    }
+
+    /** True when {@code target} sits in a different world than the golem right now — carried through
+     *  a portal, or the world was unloaded/reloaded since the target was saved. Location#distance()
+     *  (and distanceSquared) throws IllegalArgumentException across worlds, so every movement method
+     *  runs its target through this first and treats a mismatch exactly like a missing target. */
+    private boolean wrongWorld(Mob golem, Location target) {
+        return target.getWorld() != golem.getWorld();
+    }
+
+    /** Generic stall detector for the roles that give up on an unreachable target instead of
+     *  teleporting toward it (courierStuck plays the same role for the courier's own fallback).
+     *  Progress is judged by real distance covered, not time, so a golem circling an obstacle while
+     *  still closing the gap is never flagged. */
+    private boolean noProgress(Mob golem, Location target) {
+        double d = golem.getLocation().distance(target);
+        double[] st = stuckProgress.computeIfAbsent(golem.getUniqueId(), u -> new double[]{0, Double.MAX_VALUE});
+        if (d < st[1] - 0.25) {
+            st[0] = 0;
+            st[1] = d;
+            return false;
+        }
+        st[0] += 1;
+        return st[0] >= plugin.cfg.golemStuckTicks;
     }
 
     /** A standable location at/adjacent to the target block (fallback: just above the block). */
@@ -2765,13 +2927,7 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private Location getCourierDest(Mob golem) {
-        String s = golem.getPersistentDataContainer().get(courierDestKey, PersistentDataType.STRING);
-        if (s == null) return null;
-        String[] p = s.split(",");
-        if (p.length != 4) return null;
-        World w = Bukkit.getWorld(p[0]);
-        if (w == null) return null;
-        return new Location(w, Integer.parseInt(p[1]) + 0.5, Integer.parseInt(p[2]), Integer.parseInt(p[3]) + 0.5);
+        return parseLoc(golem.getPersistentDataContainer().get(courierDestKey, PersistentDataType.STRING));
     }
 
     private void clearCourierJob(Mob golem) {
@@ -2884,8 +3040,9 @@ public class GolemTicker extends BukkitRunnable {
     private boolean isContainerFull(Container container) {
         Inventory inv = container.getInventory();
         for (int i = 0; i < inv.getSize(); i++) {
-            if (inv.getItem(i) == null || inv.getItem(i).getType() == Material.AIR) return false;
-            if (inv.getItem(i).getAmount() < inv.getItem(i).getMaxStackSize()) return false;
+            ItemStack stack = inv.getItem(i);
+            if (stack == null || stack.getType() == Material.AIR) return false;
+            if (stack.getAmount() < stack.getMaxStackSize()) return false;
         }
         return true;
     }
@@ -2903,16 +3060,7 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private Location getJobFurnace(Mob golem) {
-        String s = golem.getPersistentDataContainer().get(jobFurnaceKey, PersistentDataType.STRING);
-        if (s == null) return null;
-        String[] parts = s.split(",");
-        if (parts.length != 4) return null;
-        World w = Bukkit.getWorld(parts[0]);
-        if (w == null) return null;
-        return new Location(w,
-                Integer.parseInt(parts[1]) + 0.5,
-                Integer.parseInt(parts[2]),
-                Integer.parseInt(parts[3]) + 0.5);
+        return parseLoc(golem.getPersistentDataContainer().get(jobFurnaceKey, PersistentDataType.STRING));
     }
 
     private void clearJobFurnace(Mob golem) {
@@ -2959,7 +3107,13 @@ public class GolemTicker extends BukkitRunnable {
         if (!canSearch(golem)) return;
         Block target = findTaggedContainer(golem.getLocation(),
                 plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BUCKETS), true);
-        if (target == null) { delayNextSearch(golem); return; }
+        if (target == null) {
+            setLastProblem(golem, "no " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.BUCKETS)
+                    + " container with a bucket in range");
+            delayNextSearch(golem);
+            return;
+        }
+        clearLastProblem(golem);
         clearSearchCooldown(golem);
         setTarget(golem, target.getLocation());
         setState(golem, "MOVING_TO_BUCKET");
@@ -2968,7 +3122,12 @@ public class GolemTicker extends BukkitRunnable {
     private void seekCauldron(Mob golem) {
         if (!canSearch(golem)) return;
         Block target = findLavaCauldron(golem.getLocation());
-        if (target == null) { delayNextSearch(golem); return; }
+        if (target == null) {
+            setLastProblem(golem, "no lava cauldron in range");
+            delayNextSearch(golem);
+            return;
+        }
+        clearLastProblem(golem);
         clearSearchCooldown(golem);
         setTarget(golem, target.getLocation());
         setState(golem, "MOVING_TO_CAULDRON");
@@ -2978,7 +3137,12 @@ public class GolemTicker extends BukkitRunnable {
         if (!canSearch(golem)) return;
         Block target = findTaggedContainer(golem.getLocation(),
                 plugin.tagFor(golem, LavaGolemPlugin.GolemTag.LAVA), false);
-        if (target == null) { delayNextSearch(golem); return; }
+        if (target == null) {
+            setLastProblem(golem, "no " + plugin.tagFor(golem, LavaGolemPlugin.GolemTag.LAVA) + " container in range");
+            delayNextSearch(golem);
+            return;
+        }
+        clearLastProblem(golem);
         clearSearchCooldown(golem);
         setTarget(golem, target.getLocation());
         setState(golem, "MOVING_TO_LAVA_CHEST");
@@ -3049,6 +3213,7 @@ public class GolemTicker extends BukkitRunnable {
 
     private void moveToTarget(Mob golem, ReachCallback onReach) {
         Location target = getTarget(golem);
+        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
         if (target == null) {
             String currentState = golem.getPersistentDataContainer()
                     .getOrDefault(stateKey, PersistentDataType.STRING, "SEEKING_BUCKET");
@@ -3060,9 +3225,18 @@ public class GolemTicker extends BukkitRunnable {
         }
         double dist = golem.getLocation().distance(target);
         if (dist <= plugin.cfg.reachDistance) {
+            stuckProgress.remove(golem.getUniqueId());
             Block block = target.getBlock();
             clearTarget(golem);
             onReach.onReach(golem, block);
+        } else if (noProgress(golem, target)) {
+            // Wedged against something it can't path around — give up on this target the same way
+            // the smelter/alchemist/fisher do, rather than push into the same wall forever.
+            stuckProgress.remove(golem.getUniqueId());
+            clearTarget(golem);
+            setLastProblem(golem, "stuck");
+            delayNextSearch(golem);
+            setState(golem, "SEEKING_BUCKET");
         } else {
             golem.getPathfinder().moveTo(target, 1.0);
         }
@@ -3104,8 +3278,15 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private boolean signMatches(Sign sign, String needle) {
-        var side = sign.getSide(org.bukkit.block.sign.Side.FRONT);
-        for (net.kyori.adventure.text.Component line : side.lines()) {
+        // A sign hung with its back to the container (or simply written on that side) is just as
+        // valid a tag as the front — nothing about placing a sign guarantees which face ends up
+        // pointed at the block it's tagging.
+        return sideMatches(sign, org.bukkit.block.sign.Side.FRONT, needle)
+                || sideMatches(sign, org.bukkit.block.sign.Side.BACK, needle);
+    }
+
+    private boolean sideMatches(Sign sign, org.bukkit.block.sign.Side side, String needle) {
+        for (net.kyori.adventure.text.Component line : sign.getSide(side).lines()) {
             String plain = PlainTextComponentSerializer.plainText().serialize(line);
             if (plain.equalsIgnoreCase(needle)) return true;
         }
@@ -3171,19 +3352,36 @@ public class GolemTicker extends BukkitRunnable {
         String s = loc.getWorld().getName() + "," + loc.getBlockX() + ","
                 + loc.getBlockY() + "," + loc.getBlockZ();
         golem.getPersistentDataContainer().set(targetKey, PersistentDataType.STRING, s);
+        // Progress is measured against the PREVIOUS target's distance, so a job that is re-aimed
+        // without arriving or giving up (the carried-item safety nets do exactly this) would keep
+        // counting stalls against a stale number and could declare a perfectly mobile golem stuck.
+        // Every reassignment funnels through here, so clearing it here covers all of them.
+        stuckProgress.remove(golem.getUniqueId());
     }
 
     private Location getTarget(Mob golem) {
-        String s = golem.getPersistentDataContainer().get(targetKey, PersistentDataType.STRING);
+        return parseLoc(golem.getPersistentDataContainer().get(targetKey, PersistentDataType.STRING));
+    }
+
+    /** Parses the "world,x,y,z" format every PDC-stored location in this class uses, into the block's
+     *  centre. Returns null for anything that doesn't check out — a null string, a mangled split, an
+     *  unloaded/renamed world, or (NumberFormatException) a coordinate that isn't actually a number —
+     *  since a hand-edited or corrupted PDC value is already a documented "nothing found" case in
+     *  every caller, and crashing the golem's tick over it would be worse than just losing the target. */
+    private Location parseLoc(String s) {
         if (s == null) return null;
         String[] parts = s.split(",");
         if (parts.length != 4) return null;
         World w = Bukkit.getWorld(parts[0]);
         if (w == null) return null;
-        return new Location(w,
-                Integer.parseInt(parts[1]) + 0.5,
-                Integer.parseInt(parts[2]),
-                Integer.parseInt(parts[3]) + 0.5);
+        try {
+            return new Location(w,
+                    Integer.parseInt(parts[1]) + 0.5,
+                    Integer.parseInt(parts[2]),
+                    Integer.parseInt(parts[3]) + 0.5);
+        } catch (NumberFormatException e) {
+            return null;
+        }
     }
 
     private void clearTarget(Mob golem) {
