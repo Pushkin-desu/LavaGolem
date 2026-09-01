@@ -62,6 +62,7 @@ courier-status-source-empty: "В источнике нет того, что пр
 courier-status-no-dest: "Рядом нет контейнера-приёмника"
 courier-status-dest-full: "Приёмник переполнен"
 courier-status-same: "«Откуда» и «Куда» — это ОДИН и тот же контейнер"
+courier-status-stuck: "Застрял — причина ниже"
 courier-activity: "Сейчас: "
 alchemist-heart-display-name: "Сердце алхимика"
 alchemist-heart-lore-1: "Используй ПКМ по земле,"

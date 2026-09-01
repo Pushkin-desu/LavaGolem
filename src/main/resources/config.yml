@@ -94,15 +94,119 @@ courier-carry-limit: 16
 # Waypoint marker text. Place signs with this text along a walkable path and the courier will
 # walk marker-to-marker when it can't reach a target directly (e.g. up stairs) instead of teleporting.
 waypoint-sign-text: "[Waypoint]"
-# If the courier can't path to its target (long distance / rough terrain), let it teleport
-# toward the target when stuck. Set false for pure walking (routes must be short & walkable).
-courier-teleport: true
+# The courier now plans real routes over the navmesh; a golem that still can't reach its target has
+# exhausted a full fallback ladder (fresh search, waypoint-hop, walking the best partial it has) and
+# is telling you something concrete: the route is not walkable as built. Teleporting past that is a
+# crutch left over from before there was any real pathfinding, and it actively costs you the one
+# thing this plugin is about — a golem that quietly cheats past broken infrastructure instead of
+# showing you it's broken defeats the "build it yourself" premise. The intended way to play is to
+# leave this OFF: fix the route (rebuild the stairs, clear the door) and the golem recovers on its
+# own, on a backoff, with no player action needed. Kept here (not removed) only because a server
+# running since before real pathfinding existed may have geometry that genuinely can't be walked at
+# all; if that's you, true re-enables the old blink-past-it behaviour.
+courier-teleport: false
 # Logic ticks of no path progress before the courier teleports toward its target
 # (a logic tick is `tick-period` game ticks; at the default that's ~0.5s, so 20 = ~10s).
 courier-stuck-ticks: 20
+
+# --- Navigation (long-distance walking) ---
+# Every golem now plans its walk with its own pathfinder over a cached map of "where can I stand"
+# for each chunk it's visited, instead of relying only on vanilla's short-range pathfinding plus
+# [Waypoint] hopping. Vanilla still handles the last few steps (doors, stairs, small gaps) — this
+# just gets the golem to the right neighbourhood first, reliably, over hundreds of blocks.
+# Compute the route on a background thread instead of the main server thread. Turning this off makes
+# every search run inline (still capped by nav-max-nodes), which is only worth doing if you suspect
+# the navigation threads themselves of causing trouble and want a simpler code path to rule it out.
+nav-async: true
+# How far (in blocks) a single route is allowed to reach before the search gives up and the golem
+# falls back to waypoint-hopping. Raising this lets golems walk further but a failed search over a
+# bigger area costs more before it gives up.
+nav-max-distance: 256
+# How many map cells one route search may examine before it settles for the best partial route it's
+# found so far rather than the perfect one. Lower is cheaper per search but cuts off long or twisty
+# routes early (they still make progress, just less of it per search); higher finds better routes at
+# more CPU cost per search.
+nav-max-nodes: 20000
+# How long (in seconds) a chunk's walkability map is trusted before being rebuilt from scratch, on
+# TOP of being rebuilt immediately whenever a golem notices someone dig, build, or blow something up
+# nearby — that event-based invalidation does the real work of keeping the map honest. This TTL is
+# only the backstop for the two things deliberately NOT watched for directly (water spreading, a
+# block falling), which is why it can be long: a route that takes minutes to walk round-trip
+# shouldn't have its own corridor expire behind it on the way back.
+nav-chunk-cache-seconds: 600
+# How many chunks' worth of walkability map the server is allowed to build per logic tick when a
+# golem's route runs into ground it hasn't mapped yet. Keeps a golem walking into unexplored terrain
+# from spiking the main thread all at once; it simply maps a little more of the way each tick instead.
+nav-chunks-per-tick: 4
+# Ceiling used INSTEAD of nav-chunks-per-tick for one tick whenever at least one golem is actually
+# blocked in COMPUTING waiting on chunks, rather than the usual slow trickle. These are all
+# already-LOADED chunks, so the only main-thread cost is reading the chunk snapshot — the actual
+# parse runs on the worker — which is why this can be pushed hard. Turn it back down if a big
+# multi-courier base ever shows TPS trouble from a burst of simultaneous route requests.
+nav-chunks-per-tick-burst: 24
+# How many golems may have a route search running at the same time, server-wide. Extra requests wait
+# their turn rather than piling more threads onto the CPU — a golem waiting its turn just keeps
+# walking whatever route it already has until its new one is ready.
+nav-max-concurrent: 4
+# A route search that runs into unmapped terrain waits for the map to catch up rather than walking
+# whatever incomplete, possibly-backwards partial route it found (this is what stops a golem
+# confidently marching the wrong way down a long corridor). This is the absolute ceiling on how many
+# times in a row it will wait before giving up regardless — a runaway guard, not the normal exit (see
+# nav-starved-stall-tries below for that). Deliberately generous: a search whose unmapped count is
+# still shrinking every try deserves more attempts, not fewer.
+nav-starved-retries: 40
+# The normal exit: how many consecutive waits in a row may pass with NO reduction in the unmapped-
+# chunk count before concluding the corridor has stopped growing and it's time to walk the best
+# partial instead of waiting further. Lower gives up sooner on a genuinely stuck corridor; higher
+# tolerates a slow mesher (see nav-chunks-per-tick-burst) before settling for a partial route.
+nav-starved-stall-tries: 3
+# Cap on how many chunks a leg's very first request may seed into the build queue when it pre-warms
+# the bounding box between the golem and its target (expanded 2 chunks on every side, to cover
+# detours like a staircase rather than just the straight line between the two). A long or diagonal
+# leg without this cap could flood the queue in one go; the search still works fine without every
+# chunk pre-seeded, it just discovers the rest of the corridor a little more incrementally.
+nav-prewarm-max-chunks: 256
+# How many blocks a route is allowed to step DOWN in a single move (1-3). Vanilla ground navigation
+# will not voluntarily walk a mob off anything bigger than a short drop, so setting this higher than
+# vanilla will actually follow just hands the golem a turn point it can plan to but never reach. Kept
+# at 1 by default on purpose: a golem that needs to get down five blocks should use the stairs you
+# built for it, which is exactly this plugin's philosophy, not take a shortcut off a ledge.
+nav-max-step-down: 1
+# Longest a single leg of the walk is allowed to be, in blocks (4-32). String-pulling collapses the
+# route down to the handful of turn points a straight walk can't skip, which over a long clear
+# stretch can leave two of them dozens of blocks apart -- at that distance vanilla's moveTo ends up
+# re-deriving its own route across the whole gap, using its own node budget and follow range, and can
+# fail for reasons this plugin's map never saw. Legs longer than this are chopped back down using the
+# original, already-known-walkable route points instead of a straight line through space.
+nav-max-leg-blocks: 10
+# How far past the straight line to the target a route may wander, in blocks (8-128). The search is
+# kept inside a ball around the target: big enough to walk right around a building or a hill that
+# sits between the two ends, small enough that the area is finite. That bound is also what lets a
+# golem ever conclude "there is genuinely no way through" instead of exploring open ground forever
+# and eventually wandering off in the wrong direction. Raise it if your routes take long detours.
+nav-search-margin: 32
+# How many consecutive ticks in a row the vanilla pathfinder may flatly refuse to walk toward the
+# current turn point before that counts as a stall on its own, without waiting out golem-stuck-ticks
+# (2-40). A refusal is a hard "no" from vanilla, not a guess -- there is no reason to sit on one for
+# the full distance-based window, and doing so blames whatever leg the timer happens to land on
+# rather than the one the golem actually could not walk.
+nav-move-refused-ticks: 4
 
 # Message locale: en, ru
 locale: en
 
 # Enable anonymous usage statistics via bStats (https://bstats.org/)
 bstats: true
+
+# --- Debug tracing ---
+# /golemdebug narrates a golem's decisions (and, for a courier, its pathfinding) live. This setting
+# controls where those lines go:
+#   chat - only into the toggling player's chat, same as before. Fine for standing next to a golem
+#          and watching it decide, but useless once you walk away or log off.
+#   file - only into plugins/LavaGolem/golemdebug.log (created on demand, rotated past 5MB). Nothing
+#          shows up in chat, but you can leave a courier tracing for as long as you like and grep the
+#          file afterwards instead of screenshotting scrollback.
+#   both - chat AND the file.
+# The file is written off the main thread, so tracing several golems at once never costs server tick
+# time the way writing it inline would. Anything other than chat/file/both is warned about and treated
+# as chat.

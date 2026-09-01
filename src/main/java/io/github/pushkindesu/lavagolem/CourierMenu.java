@@ -141,6 +141,23 @@ public class CourierMenu implements Listener {
 
     private ItemStack statusItem(Mob golem, CourierRoute route) {
         String status = plugin.golemTicker.courierRouteStatus(golem, route);
+        // STUCK:<reason> is free text (the recorded lastProblem), not one of the fixed translated
+        // states below — the ladder gave a SPECIFIC reason, and that's the one place in the plugin a
+        // player actually looks when a golem stops working, so it's shown verbatim rather than
+        // collapsed into a generic "not ready" message.
+        if (status.startsWith("STUCK:")) {
+            String reason = status.substring("STUCK:".length());
+            ItemStack stuckItem = new ItemStack(Material.ORANGE_DYE);
+            ItemMeta stuckMeta = stuckItem.getItemMeta();
+            stuckMeta.displayName(Component.text(plugin.msg.get("courier-status-stuck"), NamedTextColor.RED)
+                    .decoration(TextDecoration.ITALIC, false));
+            stuckMeta.lore(List.of(
+                    Component.text(reason, NamedTextColor.DARK_GRAY).decoration(TextDecoration.ITALIC, false),
+                    Component.text(plugin.msg.get("courier-activity") + plugin.golemTicker.courierActivity(golem),
+                            NamedTextColor.DARK_GRAY).decoration(TextDecoration.ITALIC, false)));
+            stuckItem.setItemMeta(stuckMeta);
+            return stuckItem;
+        }
         boolean ok = status.equals("OK");
         String key = switch (status) {
             case "OK" -> "courier-status-ok";

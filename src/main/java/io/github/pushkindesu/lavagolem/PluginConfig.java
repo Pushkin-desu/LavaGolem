@@ -12,6 +12,10 @@ public class PluginConfig {
     /** A config-defined extra fishing catch: an item added to one of the three loot pools. */
     public record CustomCatch(Material material, int weight, int amount, String pool) {}
 
+    /** Where /golemdebug's trace lines go. FILE and BOTH are what make it possible to leave a
+     *  courier tracing unattended and read the result later instead of watching chat live. */
+    public enum DebugOutput { CHAT, FILE, BOTH }
+
     public final int searchRadius;
     public final double reachDistance;
     public final long searchCooldownTicks;
@@ -41,9 +45,27 @@ public class PluginConfig {
     public final long courierStuckTicks;
     public final String locale;
     public final boolean bstats;
+    public final DebugOutput golemdebugOutput;
+    public final boolean navAsync;
+    public final int navMaxDistance;
+    public final int navMaxNodes;
+    public final long navChunkCacheSeconds;
+    public final int navChunksPerTick;
+    public final int navMaxConcurrent;
+    public final int navChunksPerTickBurst;
+    public final int navStarvedRetries;
+    public final int navStarvedStallTries;
+    public final int navPrewarmMaxChunks;
+    public final int navMaxStepDown;
+    public final int navSearchMargin;
+    public final int navMaxLegBlocks;
+    public final int navMoveRefusedTicks;
 
     public PluginConfig(LavaGolemPlugin plugin) {
-        plugin.saveDefaultConfig();
+        // saveDefaultConfig(), ConfigMigrator.migrate(), and reloadConfig() have already run by the
+        // time this constructor is called (see LavaGolemPlugin#onEnable) -- config.yml on disk is
+        // guaranteed to exist, and to carry every key this version knows about, before anything here
+        // reads a single value out of it.
         var c = plugin.getConfig();
         // The hauler/smelter/alchemist/fisher search is a cube scan too — same O(radius^3) cost as
         // the courier's, so it gets the same 1..32 clamp rather than trusting an admin-set value.
@@ -86,10 +108,90 @@ public class PluginConfig {
         this.courierSearchRadius = Math.max(1, Math.min(32, c.getInt("courier-search-radius", 24)));
         this.courierCarryLimit   = Math.max(1, Math.min(64, c.getInt("courier-carry-limit", 16)));
         this.waypointSignText    = c.getString("waypoint-sign-text", "[Waypoint]");
-        this.courierTeleport     = c.getBoolean("courier-teleport", true);
+        this.courierTeleport     = c.getBoolean("courier-teleport", false);
         this.courierStuckTicks   = c.getLong("courier-stuck-ticks", 20);
         this.locale              = c.getString("locale", "en");
         this.bstats              = c.getBoolean("bstats", true);
+        // Same warn-and-fall-back pattern as the other validated strings above: a typo here would
+        // otherwise silently leave the maintainer wondering why golemdebug.log stayed empty.
+        String rawDebugOutput = c.getString("golemdebug-output", "chat");
+        DebugOutput parsedDebugOutput;
+        switch (rawDebugOutput == null ? "" : rawDebugOutput.trim().toLowerCase(Locale.ROOT)) {
+            case "chat" -> parsedDebugOutput = DebugOutput.CHAT;
+            case "file" -> parsedDebugOutput = DebugOutput.FILE;
+            case "both" -> parsedDebugOutput = DebugOutput.BOTH;
+            default -> {
+                plugin.getLogger().warning("golemdebug-output '" + rawDebugOutput
+                        + "' is not one of chat/file/both, using chat instead.");
+                parsedDebugOutput = DebugOutput.CHAT;
+            }
+        }
+        this.golemdebugOutput = parsedDebugOutput;
+
+        this.navAsync            = c.getBoolean("nav-async", true);
+        // How far a single navmesh search is allowed to reach before giving up and letting the
+        // caller fall back — a search doesn't get cheaper just because the map does, so this is
+        // capped rather than trusted outright.
+        int rawMaxDistance = c.getInt("nav-max-distance", 256);
+        this.navMaxDistance      = Math.max(16, Math.min(1024, rawMaxDistance));
+        // Node budget per search. Too low and long routes never finish (they just return a short
+        // partial path over and over); too high and one stuck golem's search can eat a worker
+        // thread for a noticeable stretch of wall-clock time.
+        int rawMaxNodes = c.getInt("nav-max-nodes", 20000);
+        this.navMaxNodes         = Math.max(500, Math.min(200_000, rawMaxNodes));
+        // How long a chunk's walkability map is trusted before being rebuilt from scratch, on TOP of
+        // being rebuilt immediately by NavMeshListener on block place/break/explosion/piston/unload --
+        // that event-based invalidation does the real work of keeping the map honest. This TTL exists
+        // only as the backstop for the two things deliberately NOT hooked (water flow, falling blocks
+        // fire far too often to listen to), so it can afford to be long: a route that takes minutes to
+        // walk round-trip should not have its own corridor expire out from under it on the way back.
+        this.navChunkCacheSeconds = Math.max(5, c.getLong("nav-chunk-cache-seconds", 600));
+        // Raised from an earlier default of 2: a starved search now waits for its corridor instead
+        // of walking a bad partial path, so building that corridor promptly matters more than before.
+        this.navChunksPerTick    = Math.max(1, Math.min(16, c.getInt("nav-chunks-per-tick", 4)));
+        this.navMaxConcurrent    = Math.max(1, Math.min(16, c.getInt("nav-max-concurrent", 4)));
+        // Ceiling allowed for one tick while at least one golem is actually blocked in COMPUTING --
+        // these are chunks that are already LOADED, so the only main-thread cost is getChunkSnapshot
+        // (the parse itself runs on the worker), which is why this can be pushed much harder than the
+        // steady-state rate without real risk. Turn it back down if a big multi-courier base ever
+        // shows TPS trouble from a burst of simultaneous route requests.
+        this.navChunksPerTickBurst = Math.max(this.navChunksPerTick, Math.min(64, c.getInt("nav-chunks-per-tick-burst", 24)));
+        // Absolute ceiling on how many times in a row a search may come back starved before giving up
+        // on waiting and walking the best partial anyway, regardless of whether it's still making
+        // progress. This is a runaway guard, not the normal exit: the normal exit is
+        // nav-starved-stall-tries below noticing the unmapped count has stopped shrinking. Deliberately
+        // generous, since a search that's genuinely converging (19 -> 18 -> 11 -> 5 unmapped) should be
+        // allowed to keep going rather than being cut off by an arbitrary attempt count.
+        this.navStarvedRetries   = Math.max(5, Math.min(500, c.getInt("nav-starved-retries", 40)));
+        // The real exit condition: how many consecutive starved results with NO reduction in the
+        // unmapped-chunk count before concluding the corridor has stopped growing and it's time to
+        // walk the best partial instead of waiting further.
+        this.navStarvedStallTries = Math.max(1, Math.min(20, c.getInt("nav-starved-stall-tries", 3)));
+        // Cap on how many chunks a single leg's first request may seed into the build queue when it
+        // pre-warms the from/goal bounding box (expanded 2 chunks each side). Keeps a very long or
+        // very diagonal leg from flooding the queue in one go; the search still works without every
+        // chunk pre-seeded, just discovers the rest of the corridor a little more incrementally.
+        this.navPrewarmMaxChunks = Math.max(16, Math.min(4096, c.getInt("nav-prewarm-max-chunks", 256)));
+        // How many blocks a search may voluntarily step DOWN in one move. Vanilla ground navigation
+        // will not walk a mob off anything bigger than a short drop, so a value here more permissive
+        // than that just hands the golem turn points moveTo refuses to reach. Defaulted to 1 (a single
+        // stair step) rather than what AStar could safely climb DOWN on its own, because a bigger drop
+        // should be a staircase the player built, not a shortcut the golem takes off a ledge.
+        this.navMaxStepDown      = Math.max(1, Math.min(3, c.getInt("nav-max-step-down", 1)));
+        this.navSearchMargin     = Math.max(8, Math.min(128, c.getInt("nav-search-margin", 32)));
+        // Longest a single leg of the string-pulled walk is allowed to be. Over a long clear stretch,
+        // string-pulling's own line-of-sight test can leave two turn points dozens of blocks apart --
+        // moveTo then has to re-derive its own route across that whole gap using its own node budget
+        // and follow range, which can fail for reasons this plugin's model never saw. Chopping long
+        // legs back down to raw, known-walkable path points keeps every hop small enough that vanilla
+        // is doing local steering, exactly as designed, rather than a second full pathfind of its own.
+        this.navMaxLegBlocks     = Math.max(4, Math.min(32, c.getInt("nav-max-leg-blocks", 10)));
+        // How many consecutive ticks getPathfinder().moveTo() may flatly REFUSE the current turn
+        // point before that alone counts as a stall, without waiting for golem-stuck-ticks. A refusal
+        // is a hard, unambiguous "no" from vanilla -- not a heuristic like "hasn't got closer" -- so
+        // sitting on it for the full distance-based window only wastes the golem's time and blames the
+        // wrong leg: the golem never actually attempted the one the timer eventually penalises.
+        this.navMoveRefusedTicks = Math.max(2, Math.min(40, c.getInt("nav-move-refused-ticks", 4)));
     }
 
     /** Reads the optional fisher-custom-catches list. Each entry adds an item to one loot pool
