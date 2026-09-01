@@ -38,3 +38,6 @@ build/
 ### Mac OS ###
 .DS_Store
 DESCRIPTION.md
+# Debug traces copied off a test server for analysis
+/log
+*.log

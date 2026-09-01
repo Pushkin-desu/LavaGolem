@@ -1,5 +1,6 @@
 package io.github.pushkindesu.lavagolem;
 
+import io.github.pushkindesu.lavagolem.nav.Navigation;
 import io.papermc.paper.world.WeatheringCopperState;
 import net.kyori.adventure.text.serializer.plain.PlainTextComponentSerializer;
 import org.bukkit.Bukkit;
@@ -39,26 +40,22 @@ public class GolemTicker extends BukkitRunnable {
     private final NamespacedKey courierActiveKey;
     private final NamespacedKey courierDestKey;
     private final NamespacedKey courierRrKey;
-    private final NamespacedKey courierFinalKey;
+    private final NamespacedKey courierBackoffKey;
     private final NamespacedKey alchemyJobKey;
     private final NamespacedKey biteTickKey;
     private int tickCount = 0;
-
-    /** Transient per-golem "stuck" progress tracking for the courier's teleport fallback. */
-    private final Map<java.util.UUID, double[]> courierStuck = new HashMap<>(); // uuid -> {stallTicks, lastDist}
 
     /** Short-lived cache of nearby storage containers per courier, so the expensive radius cube
      *  scan runs at most every ~10s (per stationary golem) instead of on every decision. */
     private final Map<java.util.UUID, ContainerCache> courierContainerCache = new HashMap<>();
     private static final class ContainerCache {
-        long expiry; int cx, cz; List<Block> list; List<Location> waypoints;
+        long expiry; int cx, cz; List<Block> list;
     }
 
-    /** Transient per-courier navigation state: which waypoints it has already passed this leg. */
-    private final Map<java.util.UUID, java.util.Set<Long>> courierVisited = new HashMap<>();
-
-    /** Same idea as courierStuck, but for the non-courier roles, which give up on the target instead
-     *  of teleporting toward it (see noProgress). Same shape: uuid -> {stallLogicTicks, lastDistance}. */
+    /** Navigation v2 now owns all stall/progress tracking for the actual walk internally, so nothing
+     *  writes to this map any more. It's kept only because abortAlchemy/abortFisher/abortForCrash —
+     *  which this refactor must not touch — still call stuckProgress.remove(...) on give-up; those
+     *  removes are harmless no-ops against an always-empty map. */
     private final Map<java.util.UUID, double[]> stuckProgress = new HashMap<>();
 
     /** Last System.currentTimeMillis() a tick-crash was logged for a golem, so one wedged golem that
@@ -91,7 +88,7 @@ public class GolemTicker extends BukkitRunnable {
         this.courierActiveKey  = new NamespacedKey(plugin, "courier_active");
         this.courierDestKey    = new NamespacedKey(plugin, "courier_dest");
         this.courierRrKey      = new NamespacedKey(plugin, "courier_rr");
-        this.courierFinalKey   = new NamespacedKey(plugin, "courier_final");
+        this.courierBackoffKey = new NamespacedKey(plugin, "courier_backoff");
         this.alchemyJobKey     = new NamespacedKey(plugin, "alchemy_job");
         this.biteTickKey       = new NamespacedKey(plugin, "bite_tick");
     }
@@ -99,6 +96,27 @@ public class GolemTicker extends BukkitRunnable {
     @Override
     public void run() {
         tickCount++;
+
+        // Both of these run once per tick, OUTSIDE the per-golem try/catch below, so each gets its own
+        // guard — an exception here must not freeze every golem's tick the way it would if it escaped
+        // this method, which is exactly the failure mode that try/catch exists to prevent per-golem.
+        try {
+            // Builds a few more chunk navmeshes from whatever routes have asked for one this tick — see
+            // Navigation's class doc on the missing-chunk protocol. Runs once per logic tick regardless
+            // of how many golems there are, since the budget (nav-chunks-per-tick) is server-wide.
+            plugin.navigation.drainWanted();
+        } catch (Throwable t) {
+            plugin.getLogger().warning("[LG] navigation.drainWanted() threw: " + t);
+        }
+        try {
+            // Golem UUIDs change on chunk reload (HeartUseListener respawns the entity), so every map
+            // here keyed by UUID would otherwise grow forever. Sweeping every ~30s is cheap next to the
+            // per-tick cost of running every golem, and keeps this from being a slow leak long-term.
+            if (tickCount % sweepEveryLogicTicks() == 0) sweepDeadGolems();
+        } catch (Throwable t) {
+            plugin.getLogger().warning("[LG] sweepDeadGolems() threw: " + t);
+        }
+
         for (World world : Bukkit.getWorlds()) {
             // Golems are always copper golems, so scanning that narrower type instead of Mob skips a
             // PDC lookup for every other mob in the world (players' zombies, farm animals, and so on).
@@ -135,6 +153,38 @@ public class GolemTicker extends BukkitRunnable {
         }
     }
 
+    /** How many logic ticks make up ~30 seconds at the configured tick-period, used to space out
+     *  sweepDeadGolems() — computed from config rather than hardcoded since tick-period is itself
+     *  configurable and a fixed logic-tick count would drift on a server that's changed it. */
+    private long sweepEveryLogicTicks() {
+        long msPerLogicTick = plugin.cfg.tickPeriod * 50L;
+        return Math.max(1, 30_000L / msPerLogicTick);
+    }
+
+    /** Drops per-golem transient state for any UUID that no longer resolves to a live golem. Golem
+     *  UUIDs change on chunk reload (HeartUseListener respawns the entity on EntitiesLoadEvent), so
+     *  without this every map here keyed by UUID grows for as long as the server stays up. */
+    private void sweepDeadGolems() {
+        java.util.Set<java.util.UUID> alive = new java.util.HashSet<>();
+        for (World world : Bukkit.getWorlds()) {
+            for (CopperGolem golem : world.getEntitiesByClass(CopperGolem.class)) {
+                if (golem.getPersistentDataContainer().has(plugin.golemEntityKey, PersistentDataType.BYTE)) {
+                    alive.add(golem.getUniqueId());
+                }
+            }
+        }
+        stuckProgress.keySet().removeIf(id -> !alive.contains(id));
+        lastProblem.keySet().removeIf(id -> !alive.contains(id));
+        lastErrorLog.keySet().removeIf(id -> !alive.contains(id));
+        courierContainerCache.keySet().removeIf(id -> !alive.contains(id));
+        // gdebug no longer drops a debugWatchers entry just because the watching player is offline
+        // (see gdebugInternal) -- file tracing needs to survive exactly that. This is now the only
+        // thing that ever prunes it, for the one case that still needs pruning: the golem itself is
+        // gone (despawned, or reloaded to a new UUID) and nobody can ever toggle that old id off again.
+        plugin.debugWatchers.keySet().removeIf(id -> !alive.contains(id));
+        plugin.navigation.sweep(alive);
+    }
+
     /** Best-effort recovery once tickGolem has thrown: whatever broke, the golem must not stay wedged
      *  on a half-finished job forever. Reuses each role's own abort helper where one exists; the hauler
      *  and smelter have none, so their job state is unwound directly to the equivalent idle state. */
@@ -143,6 +193,7 @@ public class GolemTicker extends BukkitRunnable {
             String role = golem.getPersistentDataContainer().getOrDefault(
                     plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
             stuckProgress.remove(golem.getUniqueId());
+            plugin.navigation.cancel(golem); // whatever it was mid-walk toward, start clean next tick
             if (LavaGolemPlugin.ROLE_SMELTER.equals(role)) {
                 clearTarget(golem);
                 setSmelterState(golem, "SMELTER_IDLE");
@@ -198,11 +249,11 @@ public class GolemTicker extends BukkitRunnable {
 
         switch (state) {
             case "SEEKING_BUCKET"       -> seekBucket(golem);
-            case "MOVING_TO_BUCKET"     -> moveToTarget(golem, this::onReachBucketChest);
+            case "MOVING_TO_BUCKET"     -> moveViaHauler(golem, this::onReachBucketChest);
             case "SEEKING_CAULDRON"     -> seekCauldron(golem);
-            case "MOVING_TO_CAULDRON"   -> moveToTarget(golem, this::onReachCauldron);
+            case "MOVING_TO_CAULDRON"   -> moveViaHauler(golem, this::onReachCauldron);
             case "SEEKING_LAVA_CHEST"   -> seekLavaChest(golem);
-            case "MOVING_TO_LAVA_CHEST" -> moveToTarget(golem, this::onReachLavaChest);
+            case "MOVING_TO_LAVA_CHEST" -> moveViaHauler(golem, this::onReachLavaChest);
         }
     }
 
@@ -213,28 +264,105 @@ public class GolemTicker extends BukkitRunnable {
 
         switch (state) {
             case "SMELTER_IDLE"              -> smelterDecide(golem);
-            case "SMELTER_COLLECT_FURNACE"   -> moveToTargetSmelter(golem, this::onReachCollectFurnace);
-            case "SMELTER_TO_OUTPUT"         -> moveToTargetSmelter(golem, this::onReachOutputChest);
-            case "SMELTER_RETRIEVE_FURNACE"  -> moveToTargetSmelter(golem, this::onReachRetrieveFurnace);
-            case "SMELTER_RETURN_BUCKET"     -> moveToTargetSmelter(golem, this::onReachReturnBucket);
-            case "SMELTER_FUEL_CHEST"        -> moveToTargetSmelter(golem, this::onReachFuelChest);
-            case "SMELTER_FUEL_FURNACE"      -> moveToTargetSmelter(golem, this::onReachFuelFurnace);
-            case "SMELTER_INPUT_CHEST"       -> moveToTargetSmelter(golem, this::onReachInputChest);
-            case "SMELTER_INPUT_FURNACE"     -> moveToTargetSmelter(golem, this::onReachInputFurnace);
+            case "SMELTER_COLLECT_FURNACE"   -> moveViaSmelter(golem, this::onReachCollectFurnace);
+            case "SMELTER_TO_OUTPUT"         -> moveViaSmelter(golem, this::onReachOutputChest);
+            case "SMELTER_RETRIEVE_FURNACE"  -> moveViaSmelter(golem, this::onReachRetrieveFurnace);
+            case "SMELTER_RETURN_BUCKET"     -> moveViaSmelter(golem, this::onReachReturnBucket);
+            case "SMELTER_FUEL_CHEST"        -> moveViaSmelter(golem, this::onReachFuelChest);
+            case "SMELTER_FUEL_FURNACE"      -> moveViaSmelter(golem, this::onReachFuelFurnace);
+            case "SMELTER_INPUT_CHEST"       -> moveViaSmelter(golem, this::onReachInputChest);
+            case "SMELTER_INPUT_FURNACE"     -> moveViaSmelter(golem, this::onReachInputFurnace);
             default -> setSmelterState(golem, "SMELTER_IDLE");
         }
     }
 
-    // ---- debug tracing (toggled per-golem by /golemdebug) ----
-    private boolean isDebug(Mob golem) { return plugin.debugWatchers.containsKey(golem.getUniqueId()); }
+    // ---- debug tracing (toggled per-golem, per-role, or server-wide by /golemdebug) ----
+
+    /** "HH:mm:ss" shared by every line GolemTicker sends to golemdebug.log, matching the on/off
+     *  markers LavaGolemPlugin writes for the same file (see GolemDebugLog.timestamp()). */
+    private static final java.time.format.DateTimeFormatter DEBUG_TIME_FMT =
+            java.time.format.DateTimeFormatter.ofPattern("HH:mm:ss", java.util.Locale.ROOT);
+
+    /** Whether this golem is traced under ANY of /golemdebug's three modes: one specific golem
+     *  (debugWatchers), every golem (debugAllWatcher), or its whole role (debugRoleWatchers). The
+     *  common "nobody's debugging anything" case costs two null/empty checks; role only gets looked
+     *  at once neither of the cheaper two already matched. */
+    private boolean isDebug(Mob golem) {
+        if (plugin.debugWatchers.containsKey(golem.getUniqueId())) return true;
+        if (plugin.debugAllWatcher != null) return true;
+        return !plugin.debugRoleWatchers.isEmpty() && plugin.debugRoleWatchers.containsKey(roleOf(golem));
+    }
+
+    private String roleOf(Mob golem) {
+        return golem.getPersistentDataContainer().getOrDefault(
+                plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
+    }
 
     private void gdebug(Mob golem, String msg) {
-        java.util.UUID w = plugin.debugWatchers.get(golem.getUniqueId());
-        if (w == null) return;
-        org.bukkit.entity.Player p = Bukkit.getPlayer(w);
-        if (p == null) { plugin.debugWatchers.remove(golem.getUniqueId()); return; }
-        p.sendMessage(net.kyori.adventure.text.Component.text("[G] " + msg,
-                net.kyori.adventure.text.format.NamedTextColor.AQUA));
+        gdebugInternal(golem.getUniqueId(), golem, msg);
+    }
+
+    /** Same trace as {@link #gdebug(Mob, String)}, but by UUID — the shape Navigation's callback
+     *  needs, since it only ever has the golem's id, not the live entity, when it wants to trace. */
+    private void gdebug(java.util.UUID golemId, String msg) {
+        gdebugInternal(golemId, null, msg);
+    }
+
+    /**
+     * Single funnel for every /golemdebug trace line. Whether the line was raised with a live Mob
+     * (most call sites) or only a UUID (Navigation's tracer — see its class doc on why it never holds
+     * a live reference), this is what decides whether ANYONE is watching and, if so, where the line
+     * goes: the gate on "is anyone watching" has always lived here rather than at each call site, and
+     * that now also covers the all-golems and per-role modes, not just a single targeted golem.
+     *
+     * Chat and file are independent. An offline chat watcher silences only the chat half — with FILE
+     * or BOTH output the entry stays in debugWatchers/debugAllWatcher/debugRoleWatchers regardless, so
+     * leaving a courier tracing and reading the log after logging back in actually works, which is the
+     * whole reason file output exists.
+     */
+    private void gdebugInternal(java.util.UUID golemId, Mob golemHint, String msg) {
+        java.util.UUID chatWatcher = plugin.debugWatchers.get(golemId);
+        boolean traced = chatWatcher != null;
+        if (!traced && plugin.debugAllWatcher != null) {
+            chatWatcher = plugin.debugAllWatcher;
+            traced = true;
+        }
+        Mob golem = golemHint;
+        if (!traced && !plugin.debugRoleWatchers.isEmpty()) {
+            // Only path that ever needs to resolve a live entity from a bare UUID — deliberately
+            // rare, since it only runs once neither of the two cheaper checks above already matched.
+            if (golem == null && Bukkit.getEntity(golemId) instanceof Mob m) golem = m;
+            if (golem != null) {
+                java.util.UUID rw = plugin.debugRoleWatchers.get(roleOf(golem));
+                if (rw != null) { chatWatcher = rw; traced = true; }
+            }
+        }
+        if (!traced) return;
+
+        PluginConfig.DebugOutput out = plugin.cfg.golemdebugOutput;
+        if (out != PluginConfig.DebugOutput.FILE) {
+            org.bukkit.entity.Player p = chatWatcher != null ? Bukkit.getPlayer(chatWatcher) : null;
+            if (p != null) {
+                p.sendMessage(net.kyori.adventure.text.Component.text("[G] " + msg,
+                        net.kyori.adventure.text.format.NamedTextColor.AQUA));
+            }
+        }
+        if (out != PluginConfig.DebugOutput.CHAT) {
+            if (golem == null && Bukkit.getEntity(golemId) instanceof Mob m) golem = m;
+            String role = golem != null ? roleOf(golem) : "?";
+            String shortId = golemId.toString().substring(0, 8);
+            plugin.debugLog.enqueue("[" + DEBUG_TIME_FMT.format(java.time.LocalTime.now()) + "] ["
+                    + shortId + "/" + role + "] " + msg);
+        }
+    }
+
+    /** Navigation's window into /golemdebug — wired once from LavaGolemPlugin#onEnable via
+     *  {@code navigation.setTracer(golemTicker::traceFromNav)} so the nav layer traces through the
+     *  existing per-golem watch mechanism instead of duplicating it. The courier is the role that
+     *  most needs this: it's the one whose walk is a background search plus a fallback ladder rather
+     *  than a single vanilla moveTo, and until now nothing about that was visible from chat at all. */
+    public void traceFromNav(java.util.UUID golemId, String msg) {
+        gdebug(golemId, msg);
     }
 
     /** Why this golem last gave up its search — "stuck", "no [Lava] container in range", and so on.
@@ -948,31 +1076,9 @@ public class GolemTicker extends BukkitRunnable {
 
     // ===== SMELTER MOVEMENT =====
 
-    private void moveToTargetSmelter(Mob golem, ReachCallback onReach) {
-        Location target = getTarget(golem);
-        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
-        if (target == null) {
-            clearSearchCooldown(golem);
-            setSmelterState(golem, "SMELTER_IDLE");
-            return;
-        }
-        double dist = golem.getLocation().distance(target);
-        if (dist <= plugin.cfg.reachDistance) {
-            stuckProgress.remove(golem.getUniqueId());
-            Block block = target.getBlock();
-            clearTarget(golem);
-            onReach.onReach(golem, block);
-        } else if (noProgress(golem, target)) {
-            // Genuinely wedged against something (a wall, a step it can't climb) rather than merely
-            // en route — give up on this target exactly as if the search had found nothing at all.
-            stuckProgress.remove(golem.getUniqueId());
-            clearTarget(golem);
-            setLastProblem(golem, "stuck");
-            delayNextSearch(golem);
-            setSmelterState(golem, "SMELTER_IDLE");
-        } else {
-            golem.getPathfinder().moveTo(target, 1.0);
-        }
+    private void moveViaSmelter(Mob golem, ReachCallback onReach) {
+        moveVia(golem, getTarget(golem), Navigation.Arrival.BLOCK,
+                () -> setSmelterState(golem, "SMELTER_IDLE"), onReach);
     }
 
     // ===== ALCHEMIST =====
@@ -1065,12 +1171,12 @@ public class GolemTicker extends BukkitRunnable {
         String state = pdc.getOrDefault(stateKey, PersistentDataType.STRING, "ALCHEMIST_IDLE");
         switch (state) {
             case "ALCHEMIST_IDLE"      -> alchemistDecide(golem);
-            case "ALCHEMIST_FETCH"     -> moveToTargetAlchemist(golem, this::onReachBrewChest);
-            case "ALCHEMIST_TO_WATER"  -> moveToTargetAlchemist(golem, this::onReachWater);
-            case "ALCHEMIST_TO_CRAFT"  -> moveToTargetAlchemist(golem, this::onReachCraftingTable);
-            case "ALCHEMIST_TO_STAND"  -> moveToTargetAlchemist(golem, this::onReachStandLoad);
-            case "ALCHEMIST_COLLECT"   -> moveToTargetAlchemist(golem, this::onReachStandCollect);
-            case "ALCHEMIST_TO_OUTPUT" -> moveToTargetAlchemist(golem, this::onReachAlchemyOutput);
+            case "ALCHEMIST_FETCH"     -> moveViaAlchemist(golem, this::onReachBrewChest);
+            case "ALCHEMIST_TO_WATER"  -> moveViaAlchemist(golem, this::onReachWater);
+            case "ALCHEMIST_TO_CRAFT"  -> moveViaAlchemist(golem, this::onReachCraftingTable);
+            case "ALCHEMIST_TO_STAND"  -> moveViaAlchemist(golem, this::onReachStandLoad);
+            case "ALCHEMIST_COLLECT"   -> moveViaAlchemist(golem, this::onReachStandCollect);
+            case "ALCHEMIST_TO_OUTPUT" -> moveViaAlchemist(golem, this::onReachAlchemyOutput);
             default -> setAlchemistState(golem, "ALCHEMIST_IDLE");
         }
     }
@@ -1770,33 +1876,12 @@ public class GolemTicker extends BukkitRunnable {
         return scan;
     }
 
-    private void moveToTargetAlchemist(Mob golem, ReachCallback onReach) {
-        Location target = getTarget(golem);
-        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
-        if (target == null) {
-            clearSearchCooldown(golem);
-            setAlchemistState(golem, "ALCHEMIST_IDLE");
-            return;
-        }
-        // Centre-based reach (as for the courier): stands and containers are solid blocks the golem
-        // can never stand on, so corner-distance would read short of a golem standing right at them.
-        if (reachDist(golem.getLocation(), target) <= plugin.cfg.reachDistance) {
-            stuckProgress.remove(golem.getUniqueId());
-            Block block = target.getBlock();
-            clearTarget(golem);
-            onReach.onReach(golem, block);
-        } else if (noProgress(golem, target)) {
-            // This method also drives the fisher's chest legs (FISHER_TO_RODS/TO_OUTPUT); setting
-            // ALCHEMIST_IDLE here is safe for both — a fisher's own tick switch falls back to
-            // FISHER_IDLE on any state it doesn't recognise, exactly as it already does for a null target.
-            stuckProgress.remove(golem.getUniqueId());
-            clearTarget(golem);
-            setLastProblem(golem, "stuck");
-            delayNextSearch(golem);
-            setAlchemistState(golem, "ALCHEMIST_IDLE");
-        } else {
-            golem.getPathfinder().moveTo(target, 1.0);
-        }
+    /** Also drives the fisher's own chest legs (FISHER_TO_RODS/FISHER_TO_OUTPUT); giving up always
+     *  lands on ALCHEMIST_IDLE, which is safe for a fisher too — its own tick switch already falls
+     *  back to FISHER_IDLE on any state it doesn't recognise, exactly as it did for a null target. */
+    private void moveViaAlchemist(Mob golem, ReachCallback onReach) {
+        moveVia(golem, getTarget(golem), Navigation.Arrival.BLOCK,
+                () -> setAlchemistState(golem, "ALCHEMIST_IDLE"), onReach);
     }
 
     private void setAlchemistState(Mob golem, String state) {
@@ -1839,10 +1924,10 @@ public class GolemTicker extends BukkitRunnable {
 
         switch (state) {
             case "FISHER_IDLE"     -> fisherDecide(golem);
-            case "FISHER_TO_RODS"  -> moveToTargetAlchemist(golem, this::onReachRodsChest);
-            case "FISHER_TO_WATER" -> moveToFisherShore(golem);
+            case "FISHER_TO_RODS"  -> moveViaAlchemist(golem, this::onReachRodsChest);
+            case "FISHER_TO_WATER" -> moveViaFisherShore(golem);
             case "FISHER_FISHING"  -> fisherFish(golem);
-            case "FISHER_TO_OUTPUT"-> moveToTargetAlchemist(golem, this::onReachFisherOutput);
+            case "FISHER_TO_OUTPUT"-> moveViaAlchemist(golem, this::onReachFisherOutput);
             default -> setFisherState(golem, "FISHER_IDLE");
         }
     }
@@ -1899,27 +1984,14 @@ public class GolemTicker extends BukkitRunnable {
         setFisherState(golem, "FISHER_TO_WATER");
     }
 
-    /** Walks to the bank spot and starts fishing once actually standing on it (a tight arrival, so it
-     *  ends up on land rather than stopping a couple of blocks short in the water). */
-    private void moveToFisherShore(Mob golem) {
-        Location target = getTarget(golem);
-        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
-        if (target == null) { clearSearchCooldown(golem); setFisherState(golem, "FISHER_IDLE"); return; }
-        if (golem.getLocation().distance(target) <= 1.3) {
-            stuckProgress.remove(golem.getUniqueId());
-            clearTarget(golem);
-            onReachFishingSpot(golem);
-        } else if (noProgress(golem, target)) {
-            // No walkable bank actually reaches this cast point (a ledge too high, a wall in the way)
-            // — give up and let fisherDecide pick a fresh spot rather than shove at the water forever.
-            stuckProgress.remove(golem.getUniqueId());
-            clearTarget(golem);
-            setLastProblem(golem, "stuck");
-            delayNextSearch(golem);
-            setFisherState(golem, "FISHER_IDLE");
-        } else {
-            golem.getPathfinder().moveTo(target, 1.0);
-        }
+    /** Walks to the bank spot and starts fishing once actually standing on it. Arrival.SPOT is what
+     *  keeps this a tight, point-distance arrival rather than the centre-based BLOCK one every other
+     *  leg uses — the bank spot is somewhere to stand ON, not a solid block to stand next to, and a
+     *  looser check here is exactly how the fisher used to end up two blocks out in the water. */
+    private void moveViaFisherShore(Mob golem) {
+        moveVia(golem, getTarget(golem), Navigation.Arrival.SPOT,
+                () -> setFisherState(golem, "FISHER_IDLE"),
+                (g, b) -> onReachFishingSpot(g));
     }
 
     private void onReachRodsChest(Mob golem, Block block) {
@@ -2423,8 +2495,8 @@ public class GolemTicker extends BukkitRunnable {
         String state = pdc.getOrDefault(stateKey, PersistentDataType.STRING, "COURIER_IDLE");
         switch (state) {
             case "COURIER_IDLE"      -> courierDecide(golem);
-            case "COURIER_TO_SOURCE" -> moveToTargetCourier(golem, this::onReachCourierSource);
-            case "COURIER_TO_DEST"   -> moveToTargetCourier(golem, this::onReachCourierDest);
+            case "COURIER_TO_SOURCE" -> moveViaCourier(golem, (g, b) -> { onCourierProgress(g); onReachCourierSource(g, b); });
+            case "COURIER_TO_DEST"   -> moveViaCourier(golem, (g, b) -> { onCourierProgress(g); onReachCourierDest(g, b); });
             default -> setCourierState(golem, "COURIER_IDLE");
         }
     }
@@ -2467,11 +2539,15 @@ public class GolemTicker extends BukkitRunnable {
             if (source.getLocation().equals(dest.getLocation())) continue;
 
             clearSearchCooldown(golem);
+            clearLastProblem(golem);
+            clearCourierStuckMarker(golem);
             golem.getPersistentDataContainer().set(courierActiveKey, PersistentDataType.INTEGER, idx);
             golem.getPersistentDataContainer().set(courierRrKey, PersistentDataType.INTEGER, (idx + 1) % routes.size());
             setCourierDest(golem, dest.getLocation());
             startCourierMove(golem, source.getLocation());
             setCourierState(golem, "COURIER_TO_SOURCE");
+            gdebug(golem, "route " + idx + ": pickup " + fmtLoc(source.getLocation())
+                    + " -> drop " + fmtLoc(dest.getLocation()));
             return;
         }
         delayNextSearch(golem);
@@ -2564,161 +2640,167 @@ public class GolemTicker extends BukkitRunnable {
         } catch (Throwable ignored) { /* attribute unavailable on this version */ }
     }
 
-    // ===== COURIER MOVEMENT (with teleport fallback) =====
+    // ===== COURIER MOVEMENT =====
 
-    /** Begins a movement leg toward {@code finalLoc} (a container), routing via waypoints if needed. */
+    /** Begins a movement leg toward {@code finalLoc} (a container). Navigation now owns the actual
+     *  routing (A* over the navmesh, with waypoint-hopping as its own last-resort fallback), so this
+     *  is just the shared target field every other role already uses — no separate hop bookkeeping. */
     private void startCourierMove(Mob golem, Location finalLoc) {
-        setCourierFinal(golem, finalLoc);
-        courierVisited.remove(golem.getUniqueId());
-        courierStuck.remove(golem.getUniqueId());
-        setTarget(golem, courierHop(golem, finalLoc));
+        setTarget(golem, finalLoc);
     }
 
-    private void moveToTargetCourier(Mob golem, ReachCallback onReach) {
-        Location hop = getTarget(golem);
-        Location fin = getCourierFinal(golem);
-        if (fin == null) fin = hop;
-        // Cross-world guard (consistency with the other movement methods): a hop/final left over from
-        // before a portal trip or a world reload can't be measured against the golem's own world.
-        if (hop != null && wrongWorld(golem, hop)) hop = null;
-        if (fin != null && wrongWorld(golem, fin)) fin = null;
-        if (hop == null || fin == null) {
-            courierStuck.remove(golem.getUniqueId());
-            courierVisited.remove(golem.getUniqueId());
+    private void moveViaCourier(Mob golem, ReachCallback onReach) {
+        moveVia(golem, getTarget(golem), Navigation.Arrival.BLOCK,
+                () -> setCourierState(golem, "COURIER_IDLE"),
+                loc -> {
+                    // Navigation has already tried full A*, a fresh recompute, and the waypoint-hop
+                    // fallback by the time it reports STUCK. Teleporting past that is now an opt-in
+                    // legacy crutch (courier-teleport, default off) for servers with geometry that
+                    // genuinely can't be walked; the intended behaviour is to give up LOUDLY instead —
+                    // recorded in lastProblem, surfaced in the GUI (courierRouteStatus) and in-world
+                    // (the stuck-name marker), and retried on a backoff so a permanently broken route
+                    // costs almost nothing while a fixed one recovers on its own.
+                    if (plugin.cfg.courierTeleport) {
+                        gdebug(golem, "stuck: teleporting toward target " + fmtLoc(loc));
+                        golem.teleport(safeSpotNear(loc));
+                        plugin.navigation.cancel(golem);
+                    } else {
+                        clearTarget(golem);
+                        setLastProblem(golem, "stuck");
+                        markCourierStuck(golem);
+                        applyCourierBackoff(golem);
+                        // Cargo left in the golem's hand out here, wherever "stuck" happened to be,
+                        // is out of the station entirely -- no route can ever use it again. Re-home it
+                        // exactly like onReachCourierDest would (alt dest-tagged container, else a
+                        // source-tagged one) rather than stranding it or ever dropping it.
+                        rehomeCourierLoad(golem);
+                    }
+                },
+                onReach);
+    }
+
+    // ===== COURIER give-up handling: loud, in-world, and self-recovering =====
+
+    /** Called the moment the courier successfully ARRIVES at either leg of a job — proof the route
+     *  (or at least this stretch of it) is currently walkable. Resets the backoff so a route that's
+     *  been fixed recovers on its own the very next time it's tried, with no player action needed. */
+    private void onCourierProgress(Mob golem) {
+        golem.getPersistentDataContainer().remove(courierBackoffKey);
+    }
+
+    /** Doubles the search cooldown each consecutive time the active route exhausts the fallback
+     *  ladder, capped at ~60s, instead of retrying at the normal (search-cooldown-ticks) pace. A
+     *  route that's genuinely broken (a torn-up bridge, a walled-off door) then costs almost nothing
+     *  in repeated decision churn, while onCourierProgress clears this the moment it works again. */
+    private static final long COURIER_BACKOFF_CAP_TICKS = 1200; // ~60s at 20 ticks/sec
+
+    private void applyCourierBackoff(Mob golem) {
+        int strikes = golem.getPersistentDataContainer()
+                .getOrDefault(courierBackoffKey, PersistentDataType.INTEGER, 0);
+        long cooldown = Math.min(COURIER_BACKOFF_CAP_TICKS,
+                plugin.cfg.searchCooldownTicks * (1L << Math.min(strikes, 20)));
+        golem.getPersistentDataContainer().set(nextSearchTickKey, PersistentDataType.LONG,
+                Bukkit.getCurrentTick() + cooldown);
+        golem.getPersistentDataContainer().set(courierBackoffKey, PersistentDataType.INTEGER,
+                Math.min(strikes + 1, 30)); // capped so the shift above can never overflow a long
+    }
+
+    /**
+     * Best-effort re-home for a carried item when the courier's fallback ladder gives up terminally
+     * (moveViaCourier's onStuck, non-teleport branch): cargo left sitting in the golem's hand out in
+     * a field wherever it happened to give up is out of the station entirely, and no route can ever
+     * use it again. Mirrors onReachCourierDest's own full-destination resolution — try an alternative
+     * dest-tagged container, then fall back to a source-tagged one — without touching that protected
+     * method at all: this runs from a completely different context (the golem isn't standing next to
+     * any particular container right now), so it just redirects the target and lets the ordinary
+     * COURIER_TO_DEST leg (Navigation + the untouched onReachCourierDest) do the actual delivery once
+     * it arrives. If nothing reachable would take the item, it stays in hand and the golem idles —
+     * standing still holding it is the correct last resort; it is never dropped on the ground.
+     */
+    /** Whether two locations point at the same block. Needed because stored job locations come back
+     *  from parseLoc centred (x+0.5), while a Block's own location sits on the corner — so comparing
+     *  them with equals() silently never matches, however identical the block actually is. */
+    private boolean sameBlock(Location a, Location b) {
+        if (a == null || b == null) return false;
+        return a.getWorld() == b.getWorld()
+                && a.getBlockX() == b.getBlockX()
+                && a.getBlockY() == b.getBlockY()
+                && a.getBlockZ() == b.getBlockZ();
+    }
+
+    private void rehomeCourierLoad(Mob golem) {
+        ItemStack hand = golem.getEquipment().getItemInMainHand();
+        if (hand == null || hand.getType() == Material.AIR) {
             setCourierState(golem, "COURIER_IDLE");
             return;
         }
-
-        // Arrived at the final container? Measure to the block's CENTER, not its corner: a container
-        // is a solid block the golem can't stand on, and when another container blocks the near face
-        // the golem stops one cell back. Corner-distance then reads ~0.5 over the real gap and the
-        // golem would stall and teleport while physically already next to the target.
-        if (reachDist(golem.getLocation(), fin) <= plugin.cfg.reachDistance) {
-            courierStuck.remove(golem.getUniqueId());
-            courierVisited.remove(golem.getUniqueId());
-            Block block = fin.getBlock();
-            clearTarget(golem);
-            onReach.onReach(golem, block);
-            return;
+        CourierRoute route = activeCourierRoute(golem);
+        // The destination we just failed to reach, captured before any setCourierDest overwrites it.
+        // Without excluding it, a route whose dest tag marks a single container -- the ordinary case --
+        // would "find an alternative", get handed back the very chest it couldn't reach, and loop
+        // there forever without ever falling through to returning the load to its source.
+        Location failed = getCourierDest(golem);
+        if (route != null) {
+            int r = plugin.cfg.courierSearchRadius;
+            Location origin = golem.getLocation();
+            Block alt = findCourierDest(origin, route.dest, r);
+            if (alt != null && !sameBlock(alt.getLocation(), failed)) {
+                setCourierDest(golem, alt.getLocation());
+                startCourierMove(golem, alt.getLocation());
+                setCourierState(golem, "COURIER_TO_DEST");
+                return;
+            }
+            Block back = findCourierDest(origin, route.source, r);
+            if (back != null) {
+                setCourierDest(golem, back.getLocation());
+                startCourierMove(golem, back.getLocation());
+                setCourierState(golem, "COURIER_TO_DEST"); // onReachCourierDest doesn't care which tag it was
+                return;
+            }
         }
-
-        // Reached the current waypoint hop → mark it passed and pick the next hop toward the final.
-        if (reachDist(golem.getLocation(), hop) <= plugin.cfg.reachDistance) {
-            markVisited(golem, hop);
-            courierStuck.remove(golem.getUniqueId());
-            setTarget(golem, courierHop(golem, fin));
-            return;
-        }
-
-        // Walk to the current hop. Teleport (to the final) ONLY after genuinely making no headway
-        // toward the hop for the full stuck window — never as a quick reaction to moveTo() briefly
-        // returning false, which made it blink ~10 blocks early even on a clear straight line (the
-        // target is the container's solid block, so pathing to it reports "false" intermittently).
-        // It now walks the whole way and blinks only when truly stuck. st = {stallTicks, lastDist}.
-        double[] st = courierStuck.computeIfAbsent(golem.getUniqueId(), u -> new double[]{0, Double.MAX_VALUE});
-        double d = golem.getLocation().distance(hop);
-        if (d < st[1] - 0.25) {        // got at least a quarter-block closer → still making progress
-            st[0] = 0;
-            st[1] = d;
-        } else {
-            st[0] += 1;                // no measurable progress this tick
-        }
-        if (plugin.cfg.courierTeleport && st[0] >= plugin.cfg.courierStuckTicks) {
-            golem.teleport(safeSpotNear(fin));
-            courierVisited.remove(golem.getUniqueId());
-            setTarget(golem, fin);
-            st[0] = 0;
-            st[1] = Double.MAX_VALUE;
-        } else {
-            golem.getPathfinder().moveTo(hop, 1.0);
-        }
+        // Nothing reachable to hand it back to right now -- hold the load and idle. courierDecide's
+        // own carried-item safety net already re-tries whatever courierDestKey currently points at
+        // every time canSearch() next allows it (paced by the backoff above), so this keeps trying
+        // on its own without spinning: never a busy loop, never a dropped item.
+        setCourierState(golem, "COURIER_IDLE");
     }
 
-    /** Next hop toward {@code finalLoc}: the final itself if directly walkable, else the waypoint
-     *  CLOSEST TO THE FINAL among those this golem can actually path to and hasn't passed yet.
-     *  Waypoints are shared, anonymous road signs: every golem evaluates them against its own goal,
-     *  so one network of markers serves any number of couriers and routes with no configuration. */
-    private Location courierHop(Mob golem, Location finalLoc) {
-        if (pathReaches(golem, finalLoc)) return finalLoc;
-        List<Location> wps = courierScan(golem, golem.getLocation(), plugin.cfg.courierSearchRadius).waypoints;
-        java.util.Set<Long> visited = courierVisited.get(golem.getUniqueId());
-        List<Location> candidates = new ArrayList<>();
-        for (Location w : wps) {
-            if (visited != null && visited.contains(keyOf(w))) continue;
-            candidates.add(w);
-        }
-        candidates.sort(java.util.Comparator.comparingDouble(w -> w.distanceSquared(finalLoc)));
-        // Best-first: take the closest-to-goal marker we can reach. Each miss costs one pathfind,
-        // so bound the tries; a hop is only picked on arrival, not every tick.
-        int tries = Math.min(candidates.size(), HOP_CANDIDATE_LIMIT);
-        for (int i = 0; i < tries; i++) {
-            Location w = candidates.get(i);
-            if (pathReaches(golem, w)) return w;
-        }
-        // No direct path and no usable marker: rather than beeline at an unreachable far block (which
-        // just stalls and teleports), walk to the farthest point ALONG THE WAY we can actually path to.
-        // This makes long walkable stretches (e.g. a straight corridor past the last stair marker) get
-        // covered on foot without a marker on every span. Teleport only if even this finds nothing.
-        Location stone = steppingStoneToward(golem, finalLoc);
-        return stone != null ? stone : finalLoc;
+    /** Short, in-world "something's wrong here" signal that needs no menu open to see — a player
+     *  walking past a base full of golems should be able to spot the stuck one at a glance. No
+     *  particles: those would fire every tick a golem sits idle, which is most of the time by design. */
+    private static final String STUCK_NAME_SUFFIX = " (stuck)";
+
+    private void markCourierStuck(Mob golem) {
+        String name = plainCustomName(golem);
+        if (name.endsWith(STUCK_NAME_SUFFIX)) return; // already marked
+        golem.customName(net.kyori.adventure.text.Component.text(name + STUCK_NAME_SUFFIX,
+                net.kyori.adventure.text.format.NamedTextColor.RED));
+        golem.setCustomNameVisible(true);
     }
 
-    private static final int HOP_CANDIDATE_LIMIT = 8;
-
-    /** The farthest standable point on the straight line toward {@code target} that the mob can
-     *  actually path to right now, or null if it can't even advance a few blocks that way. */
-    private Location steppingStoneToward(Mob golem, Location target) {
-        Location from = golem.getLocation();
-        org.bukkit.util.Vector dir = target.toVector().subtract(from.toVector());
-        double dist = dir.length();
-        if (dist < 3) return null;
-        dir.multiply(1.0 / dist); // unit vector toward the target
-        double max = Math.min(dist - 1, plugin.cfg.courierSearchRadius);
-        // Probe far → near so the first reachable point is the biggest safe stride.
-        for (double step = max; step >= 3; step -= 3) {
-            Location probe = from.clone().add(dir.getX() * step, dir.getY() * step, dir.getZ() * step);
-            Location spot = safeSpotNear(probe);
-            if (spot != null && pathReaches(golem, spot)) return spot;
-        }
-        return null;
+    /** Clears the stuck marker the moment the golem starts trying its route again (courierDecide),
+     *  which is optimistic on purpose — if the very next attempt fails too, markCourierStuck simply
+     *  reapplies it once the ladder is exhausted again. */
+    private void clearCourierStuckMarker(Mob golem) {
+        String name = plainCustomName(golem);
+        if (!name.endsWith(STUCK_NAME_SUFFIX)) return;
+        String restored = name.substring(0, name.length() - STUCK_NAME_SUFFIX.length());
+        golem.customName(net.kyori.adventure.text.Component.text(restored, net.kyori.adventure.text.format.NamedTextColor.GOLD));
     }
 
-    /** Whether the mob's navigation can build a path whose end actually reaches {@code loc}. */
-    private boolean pathReaches(Mob golem, Location loc) {
-        var pf = golem.getPathfinder();
-        if (!pf.moveTo(loc, 1.0)) return false;
-        var path = pf.getCurrentPath();
-        if (path == null) return false;
-        Location fp = path.getFinalPoint();
-        return fp != null && fp.distanceSquared(loc) <= 6.25; // within ~2.5 blocks of the goal
+    private String plainCustomName(Mob golem) {
+        net.kyori.adventure.text.Component name = golem.customName();
+        return name == null ? "" : PlainTextComponentSerializer.plainText().serialize(name);
     }
 
-    private void markVisited(Mob golem, Location w) {
-        courierVisited.computeIfAbsent(golem.getUniqueId(), u -> new java.util.HashSet<>()).add(keyOf(w));
-    }
-
-    private long keyOf(Location l) {
-        return Block.getBlockKey(l.getBlockX(), l.getBlockY(), l.getBlockZ());
-    }
-
-    private void setCourierFinal(Mob golem, Location loc) {
-        String s = loc.getWorld().getName() + "," + loc.getBlockX() + ","
-                + loc.getBlockY() + "," + loc.getBlockZ();
-        golem.getPersistentDataContainer().set(courierFinalKey, PersistentDataType.STRING, s);
-    }
-
-    private Location getCourierFinal(Mob golem) {
-        return parseLoc(golem.getPersistentDataContainer().get(courierFinalKey, PersistentDataType.STRING));
-    }
-
-    /** Distance from {@code from} to the CENTER of the block {@code blockLoc} points at. Normalises a
-     *  block-corner target (x.0) to its centre (x.5) so "standing right next to a solid container"
-     *  is measured honestly, whether the stored target was a corner or an already-centred waypoint. */
-    private double reachDist(Location from, Location blockLoc) {
-        double dx = from.getX() - (blockLoc.getBlockX() + 0.5);
-        double dy = from.getY() - (blockLoc.getBlockY() + 0.5);
-        double dz = from.getZ() - (blockLoc.getBlockZ() + 0.5);
-        return Math.sqrt(dx * dx + dy * dy + dz * dz);
+    /** Value-equality for two CourierRoute instances by source/dest tag — routes are re-parsed from
+     *  PDC on every call (see getCourierRoutes), so reference equality would never match even for
+     *  what's conceptually the same configured route. Used only to check whether the route a status
+     *  lookup is asking about is the one lastProblem was recorded against. */
+    private boolean sameRoute(CourierRoute a, CourierRoute b) {
+        return a != null && b != null
+                && java.util.Objects.equals(a.source, b.source)
+                && java.util.Objects.equals(a.dest, b.dest);
     }
 
     /** True when {@code target} sits in a different world than the golem right now — carried through
@@ -2729,20 +2811,71 @@ public class GolemTicker extends BukkitRunnable {
         return target.getWorld() != golem.getWorld();
     }
 
-    /** Generic stall detector for the roles that give up on an unreachable target instead of
-     *  teleporting toward it (courierStuck plays the same role for the courier's own fallback).
-     *  Progress is judged by real distance covered, not time, so a golem circling an obstacle while
-     *  still closing the gap is never flagged. */
-    private boolean noProgress(Mob golem, Location target) {
-        double d = golem.getLocation().distance(target);
-        double[] st = stuckProgress.computeIfAbsent(golem.getUniqueId(), u -> new double[]{0, Double.MAX_VALUE});
-        if (d < st[1] - 0.25) {
-            st[0] = 0;
-            st[1] = d;
-            return false;
+    /** Short "x,y,z" for a debug trace line -- concise on purpose, since gdebug output goes straight
+     *  to a player's chat. */
+    private String fmtLoc(Location l) {
+        return l.getBlockX() + "," + l.getBlockY() + "," + l.getBlockZ();
+    }
+
+    // ===== NAVIGATION v2 — the single entry point every role's movement goes through =====
+
+    /**
+     * Delegates one logic tick of movement toward {@code target} to {@link Navigation} and reacts to
+     * what it reports: ARRIVED clears the target and fires {@code onReach} (exactly as every old
+     * moveToTarget* method did), STUCK hands off to {@code onStuck} to decide how this role gives up,
+     * and MOVING/COMPUTING need nothing from GolemTicker at all — Navigation is already steering the
+     * golem (or waiting on a background search) and will keep doing so next tick.
+     *
+     * A null or wrong-world target never reaches Navigation — that guard is preserved here exactly as
+     * every old movement method ran it first, so a stale target from before a portal trip or a world
+     * reload is handled identically to one that was never set.
+     */
+    private void moveVia(Mob golem, Location target, Navigation.Arrival mode,
+                         Runnable onNoTarget, java.util.function.Consumer<Location> onStuck,
+                         ReachCallback onReach) {
+        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
+        if (target == null) { onNoTarget.run(); return; }
+        Navigation.Status status = plugin.navigation.tick(golem, target, mode);
+        switch (status) {
+            case ARRIVED -> {
+                Block block = target.getBlock();
+                clearTarget(golem);
+                onReach.onReach(golem, block);
+            }
+            case STUCK -> onStuck.accept(target);
+            case MOVING, COMPUTING -> { /* Navigation is already handling this tick's steering */ }
         }
-        st[0] += 1;
-        return st[0] >= plugin.cfg.golemStuckTicks;
+    }
+
+    /** Convenience for the shape every non-courier, non-hauler role shares: give up to the same idle
+     *  state whether the target vanished or Navigation genuinely ran out of options. */
+    private void moveVia(Mob golem, Location target, Navigation.Arrival mode, Runnable setIdle, ReachCallback onReach) {
+        moveVia(golem, target, mode,
+                () -> { clearSearchCooldown(golem); setIdle.run(); },
+                loc -> { clearTarget(golem); setLastProblem(golem, "stuck"); delayNextSearch(golem); setIdle.run(); },
+                onReach);
+    }
+
+    private void moveViaHauler(Mob golem, ReachCallback onReach) {
+        moveVia(golem, getTarget(golem), Navigation.Arrival.BLOCK,
+                () -> {
+                    // Preserves the hauler's own quirk: on a vanished target it resumes SEARCHING for
+                    // whatever it was moving toward (SEEKING_BUCKET/CAULDRON/LAVA_CHEST), rather than
+                    // collapsing every sub-job to one shared idle state like the other roles do.
+                    String currentState = golem.getPersistentDataContainer()
+                            .getOrDefault(stateKey, PersistentDataType.STRING, "SEEKING_BUCKET");
+                    if (currentState.startsWith("MOVING_TO_")) {
+                        clearSearchCooldown(golem);
+                        setState(golem, "SEEKING_" + currentState.substring("MOVING_TO_".length()));
+                    }
+                },
+                loc -> {
+                    clearTarget(golem);
+                    setLastProblem(golem, "stuck");
+                    delayNextSearch(golem);
+                    setState(golem, "SEEKING_BUCKET");
+                },
+                onReach);
     }
 
     /** A standable location at/adjacent to the target block (fallback: just above the block). */
@@ -2766,8 +2899,10 @@ public class GolemTicker extends BukkitRunnable {
 
     // ===== COURIER SEARCH & STATE HELPERS =====
 
-    /** Cached one-pass scan of nearby storage containers AND waypoint signs, refreshed ~every 10s
-     *  while the courier stays put. Cached handles are re-validated live on use. */
+    /** Cached one-pass scan of nearby storage containers, refreshed ~every 10s while the courier
+     *  stays put. Cached handles are re-validated live on use. [Waypoint] signs are no longer
+     *  collected here — Navigation does its own scan for them, only when it actually needs one (cost
+     *  bias during a search, or the waypoint-hop fallback), which is far rarer than every decision. */
     private ContainerCache courierScan(Mob golem, Location origin, int r) {
         long now = Bukkit.getCurrentTick();
         ContainerCache c = courierContainerCache.get(golem.getUniqueId());
@@ -2780,21 +2915,13 @@ public class GolemTicker extends BukkitRunnable {
         nc.cx = origin.getBlockX();
         nc.cz = origin.getBlockZ();
         nc.list = new ArrayList<>();
-        nc.waypoints = new ArrayList<>();
         World world = origin.getWorld();
         int ox = origin.getBlockX(), oy = origin.getBlockY(), oz = origin.getBlockZ();
         for (int dx = -r; dx <= r; dx++) {
             for (int dy = -r; dy <= r; dy++) {
                 for (int dz = -r; dz <= r; dz++) {
                     Block b = world.getBlockAt(ox + dx, oy + dy, oz + dz);
-                    Material t = b.getType();
-                    if (isStorageMaterial(t)) {
-                        nc.list.add(b);
-                    } else if (Tag.ALL_SIGNS.isTagged(t)
-                            && b.getState() instanceof Sign sign
-                            && signMatches(sign, plugin.cfg.waypointSignText)) {
-                        nc.waypoints.add(b.getLocation().add(0.5, 0, 0.5));
-                    }
+                    if (isStorageMaterial(b.getType())) nc.list.add(b);
                 }
             }
         }
@@ -2802,9 +2929,16 @@ public class GolemTicker extends BukkitRunnable {
         return nc;
     }
 
-    /** Diagnostic for the courier GUI: why (or whether) a route can currently run. */
+    /** Diagnostic for the courier GUI: why (or whether) a route can currently run. A route the golem
+     *  most recently gave up on (see moveViaCourier's onStuck branch) reports that reason directly --
+     *  ahead of the usual structural checks, since "the ladder gave up" is a stronger, more specific
+     *  signal than "no source container in range" even if both happen to be true right now. */
     public String courierRouteStatus(Mob golem, CourierRoute route) {
         if (route == null || !route.isConfigured()) return "UNCONFIGURED";
+        String problem = lastProblem(golem);
+        if (problem != null && sameRoute(route, activeCourierRoute(golem))) {
+            return "STUCK:" + problem;
+        }
         Location origin = golem.getLocation();
         int r = plugin.cfg.courierSearchRadius;
         List<Block> containers = collectStorageContainers(origin, r);
@@ -2933,8 +3067,6 @@ public class GolemTicker extends BukkitRunnable {
     private void clearCourierJob(Mob golem) {
         golem.getPersistentDataContainer().remove(courierActiveKey);
         golem.getPersistentDataContainer().remove(courierDestKey);
-        golem.getPersistentDataContainer().remove(courierFinalKey);
-        courierVisited.remove(golem.getUniqueId());
     }
 
     private void abortCourier(Mob golem) {
@@ -3209,38 +3341,10 @@ public class GolemTicker extends BukkitRunnable {
         setState(golem, "SEEKING_BUCKET");
     }
 
-    // ===== MOVEMENT (Pathfinder API) =====
-
-    private void moveToTarget(Mob golem, ReachCallback onReach) {
-        Location target = getTarget(golem);
-        if (target != null && wrongWorld(golem, target)) { clearTarget(golem); target = null; }
-        if (target == null) {
-            String currentState = golem.getPersistentDataContainer()
-                    .getOrDefault(stateKey, PersistentDataType.STRING, "SEEKING_BUCKET");
-            if (currentState.startsWith("MOVING_TO_")) {
-                clearSearchCooldown(golem);
-                setState(golem, "SEEKING_" + currentState.substring("MOVING_TO_".length()));
-            }
-            return;
-        }
-        double dist = golem.getLocation().distance(target);
-        if (dist <= plugin.cfg.reachDistance) {
-            stuckProgress.remove(golem.getUniqueId());
-            Block block = target.getBlock();
-            clearTarget(golem);
-            onReach.onReach(golem, block);
-        } else if (noProgress(golem, target)) {
-            // Wedged against something it can't path around — give up on this target the same way
-            // the smelter/alchemist/fisher do, rather than push into the same wall forever.
-            stuckProgress.remove(golem.getUniqueId());
-            clearTarget(golem);
-            setLastProblem(golem, "stuck");
-            delayNextSearch(golem);
-            setState(golem, "SEEKING_BUCKET");
-        } else {
-            golem.getPathfinder().moveTo(target, 1.0);
-        }
-    }
+    // ===== MOVEMENT =====
+    // Every role's actual walking goes through moveVia and Navigation now (see the "NAVIGATION v2"
+    // section above) — moveViaHauler/moveViaSmelter/moveViaAlchemist/moveViaFisherShore/moveViaCourier
+    // are this role's thin wrapper around it.
 
     // ===== BLOCK SEARCH =====
 

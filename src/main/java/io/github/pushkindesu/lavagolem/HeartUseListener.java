@@ -16,6 +16,7 @@ import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
 import org.bukkit.event.player.PlayerInteractAtEntityEvent;
+import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
 import org.bukkit.event.world.EntitiesLoadEvent;
 import org.bukkit.event.world.EntitiesUnloadEvent;
@@ -215,8 +216,20 @@ public class HeartUseListener implements Listener {
         }
     }
 
+    /**
+     * Right-clicking an entity fires TWO independent events with their own separate handler lists —
+     * {@code PlayerInteractEntityEvent} (the base class) and {@code PlayerInteractAtEntityEvent} (a
+     * subclass that also carries the click position) — despite the inheritance relationship, Bukkit
+     * dispatches each to only the listeners registered for that exact class. Cancelling only one of
+     * them still leaves the other's default handling live, and for a copper golem that default
+     * handling is vanilla's "take the item out of its hands" — which is exactly the bug this method
+     * pair exists to close: a golem could be stripped of a carried stack by anyone right-clicking it,
+     * with no ownership check, just by however Paper happens to split the interaction across events.
+     * So both are handled here, and both are always cancelled; only the base-class instance ever does
+     * the actual menu/disassemble work, so a single right-click still produces exactly one action.
+     */
     @EventHandler
-    public void onGolemInteract(PlayerInteractAtEntityEvent event) {
+    public void onGolemInteract(PlayerInteractEntityEvent event) {
         if (event.getHand() != EquipmentSlot.HAND) return;
         if (!(event.getRightClicked() instanceof Mob golem)) return;
         Byte tag = golem.getPersistentDataContainer()
@@ -225,6 +238,11 @@ public class HeartUseListener implements Listener {
 
         event.setCancelled(true);
         Player player = event.getPlayer();
+        correctEquipment(player, golem);
+        // The PlayerInteractAtEntityEvent handler below cancels its own instance and does the same
+        // correction and nothing else; the work happens exactly once, here, only for the plain
+        // base-class event.
+        if (event instanceof PlayerInteractAtEntityEvent) return;
 
         if (player.isSneaking()
                 && player.getInventory().getItemInMainHand().getType() == Material.AIR) {
@@ -259,5 +277,41 @@ public class HeartUseListener implements Listener {
                 plugin.golemMenu.open(player, golem);
             }
         }
+    }
+
+    /** Cancel-only twin of {@link #onGolemInteract(PlayerInteractEntityEvent)} — see that method's
+     *  doc for why this separate registration exists at all: this subclass event has its own handler
+     *  list, so without this method vanilla's item-take on a copper golem is never actually stopped. */
+    @EventHandler
+    public void onGolemInteractAt(PlayerInteractAtEntityEvent event) {
+        if (event.getHand() != EquipmentSlot.HAND) return;
+        if (!(event.getRightClicked() instanceof Mob golem)) return;
+        if (!golem.getPersistentDataContainer().has(plugin.golemEntityKey, PersistentDataType.BYTE)) return;
+        event.setCancelled(true);
+        correctEquipment(event.getPlayer(), golem);
+    }
+
+    /**
+     * The client predicts vanilla's copper-golem item-take the instant it sends the interact packet,
+     * removing the item from its own copy of the entity before the server ever answers. Cancelling
+     * the event stops the SERVER from acting on it, but sends no correction packet of its own, so the
+     * client's stale (empty-handed) view of the golem persists until the entity is re-tracked -- which
+     * is why the item only "reappears" on some later, unrelated trigger. This pushes the true
+     * equipment back to that one player explicitly, for both hands: the fisher keeps its rod in the
+     * off-hand, so without this a poked fisher would look like it lost its (possibly Unbreaking III)
+     * rod exactly the same way a courier looked like it lost its carried item.
+     *
+     * The one-tick delay matters: sending the correction on the SAME tick as the click lands before
+     * the client has finished applying its own prediction, which then overwrites the correction it
+     * was meant to undo. A tick later, the prediction has already happened and stuck.
+     */
+    private void correctEquipment(Player player, Mob golem) {
+        Bukkit.getScheduler().runTask(plugin, () -> {
+            if (!player.isOnline() || !golem.isValid()) return; // either could be gone a tick later
+            var equipment = golem.getEquipment();
+            if (equipment == null) return;
+            player.sendEquipmentChange(golem, EquipmentSlot.HAND, equipment.getItemInMainHand());
+            player.sendEquipmentChange(golem, EquipmentSlot.OFF_HAND, equipment.getItemInOffHand());
+        });
     }
 }

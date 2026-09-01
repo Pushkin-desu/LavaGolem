@@ -13,7 +13,7 @@ commands:
     description: Show aggregate statistics for all lava golems
     permission: lavagolem.admin
   golemdebug:
-    description: Toggle live decision tracing for the nearest golem
+    description: Toggle live decision tracing. No args = nearest golem; "all" = every golem; a role name (lava_hauler/smelter/courier/alchemist/fisher) = every golem of that role
     permission: lavagolem.admin
 permissions:
   lavagolem.admin:

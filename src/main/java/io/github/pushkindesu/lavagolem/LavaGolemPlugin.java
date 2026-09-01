@@ -4,6 +4,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.format.NamedTextColor;
 import net.kyori.adventure.text.format.TextDecoration;
 import org.bukkit.Bukkit;
+import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
@@ -19,9 +20,11 @@ import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -103,6 +106,74 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public static final String ROLE_ALCHEMIST = "ALCHEMIST";
     public static final String ROLE_FISHER = "FISHER";
 
+    /** Resolves the argument to /golemdebug's role-targeting form (e.g. "courier", "couriers") to
+     *  the canonical role constant, accepting the obvious short forms so a server owner doesn't have
+     *  to remember or type the exact PDC value. Returns null for anything unrecognised. */
+    public static String resolveDebugRole(String arg) {
+        String a = arg.toLowerCase(Locale.ROOT).replace("_", "").replace("-", "");
+        return switch (a) {
+            case "hauler", "haulers", "lava", "lavahauler", "lavagolem" -> ROLE_HAULER;
+            case "smelter", "smelters" -> ROLE_SMELTER;
+            case "courier", "couriers" -> ROLE_COURIER;
+            case "alchemist", "alchemists" -> ROLE_ALCHEMIST;
+            case "fisher", "fishers" -> ROLE_FISHER;
+            default -> null;
+        };
+    }
+
+    /** Short, human phrase for the /golemdebug confirmation message describing where the trace is
+     *  actually going, so "watch chat" isn't printed when chat is exactly where it ISN'T going. */
+    private String debugOutputHint() {
+        return switch (cfg.golemdebugOutput) {
+            case CHAT -> "watch chat";
+            case FILE -> "see plugins/LavaGolem/golemdebug.log";
+            case BOTH -> "watch chat, also logged to golemdebug.log";
+        };
+    }
+
+    /** Counts live golems, optionally filtered to one role, for the /golemdebug all|<role> confirmation
+     *  ("N currently") — purely informational, so a player knows immediately whether the toggle they
+     *  just typed actually matched anything. */
+    private int countGolems(String roleFilterOrNull) {
+        int n = 0;
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity e : world.getEntitiesByClass(Mob.class)) {
+                if (!e.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                if (roleFilterOrNull != null) {
+                    String role = e.getPersistentDataContainer()
+                            .getOrDefault(roleKey, PersistentDataType.STRING, ROLE_HAULER);
+                    if (!roleFilterOrNull.equals(role)) continue;
+                }
+                n++;
+            }
+        }
+        return n;
+    }
+
+    /** Writes the file marker for toggling ONE specific golem — full UUID, role, and location, since
+     *  with file output several golems can be traced at once and these markers are how the maintainer
+     *  finds the right section instead of scrolling through interleaved lines. No-op under chat-only
+     *  output: there's no file to mark. */
+    private void logDebugToggleMarker(Mob golem, boolean on, org.bukkit.entity.Player by) {
+        if (cfg.golemdebugOutput == PluginConfig.DebugOutput.CHAT || debugLog == null) return;
+        String role = golem.getPersistentDataContainer()
+                .getOrDefault(roleKey, PersistentDataType.STRING, ROLE_HAULER);
+        Location l = golem.getLocation();
+        String where = l.getWorld().getName() + " " + l.getBlockX() + "," + l.getBlockY() + "," + l.getBlockZ();
+        debugLog.enqueue("[" + GolemDebugLog.timestamp() + "] === TRACE " + (on ? "ON " : "OFF ")
+                + golem.getUniqueId() + " (" + role + ") at " + where + ", toggled by " + by.getName() + " ===");
+    }
+
+    /** Same marker as {@link #logDebugToggleMarker}, but for the broad "all" / "<role>" modes, which
+     *  don't name one golem — so the label is descriptive text ("ALL golems", "role COURIER")
+     *  instead, plus the count for an ON marker (an OFF marker has nothing meaningful to count). */
+    private void logDebugBroadMarker(String label, boolean on, org.bukkit.entity.Player by, int count) {
+        if (cfg.golemdebugOutput == PluginConfig.DebugOutput.CHAT || debugLog == null) return;
+        String suffix = on ? " (" + count + " golem(s) currently)" : "";
+        debugLog.enqueue("[" + GolemDebugLog.timestamp() + "] === TRACE " + (on ? "ON " : "OFF ")
+                + label + suffix + ", toggled by " + by.getName() + " ===");
+    }
+
     /** Whether a role is switched on in the config. A disabled role can't be crafted or spawned, and
      *  any golems of that role already in the world sit inert until it's switched back on. */
     public boolean isRoleEnabled(String role) {
@@ -121,8 +192,20 @@ public final class LavaGolemPlugin extends JavaPlugin {
     /** UUIDs of golems whose vanilla AI has already been cleaned up in this session. */
     public final Set<UUID> cleanedUpGolems = ConcurrentHashMap.newKeySet();
 
-    /** golem UUID -> watching player UUID, for /golemdebug live decision tracing. Transient. */
+    /** golem UUID -> watching player UUID, for /golemdebug live decision tracing of ONE specific
+     *  golem (the original "walk up to it and toggle" behaviour). Transient. */
     public final Map<UUID, UUID> debugWatchers = new ConcurrentHashMap<>();
+
+    /** Watching player UUID for {@code /golemdebug all}, or null when nobody has it on. Kept as its
+     *  own flag rather than stuffing every golem's UUID into debugWatchers so it also covers golems
+     *  that spawn AFTER the toggle, and turning it off never has to enumerate the whole server. */
+    public volatile UUID debugAllWatcher;
+
+    /** Role -> watching player UUID for {@code /golemdebug <role>} — same reasoning as
+     *  debugAllWatcher, just scoped to one role instead of every golem. Transient. */
+    public final Map<String, UUID> debugRoleWatchers = new ConcurrentHashMap<>();
+
+    public GolemDebugLog debugLog;
 
     /** Valid inputs per furnace kind, discovered from recipes at startup.
      *  smeltableInputs (regular furnace) is a superset of the other two in vanilla. */
@@ -137,6 +220,8 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public AlchemistMenu alchemistMenu;
     public TagPrompt tagPrompt;
     public GolemTicker golemTicker;
+    public io.github.pushkindesu.lavagolem.nav.NavMesh navMesh;
+    public io.github.pushkindesu.lavagolem.nav.Navigation navigation;
 
     /** Golems whose settings menu is currently open. The ticker holds any such golem still, whatever
      *  its role, so it doesn't wander off (or act on a half-configured route) while you're in its menu. */
@@ -146,6 +231,10 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public void markMenuOpen(org.bukkit.entity.Mob golem) {
         openMenus.add(golem.getUniqueId());
         golem.getPathfinder().stopPathfinding();
+        // A courier (or any role) mid-search can otherwise sit on a wedged nav state that only an
+        // external reset clears -- a menu open is a natural, always-safe point to force that reset,
+        // since the golem is about to stand still anyway and will re-plan fresh once the menu closes.
+        if (navigation != null) navigation.cancel(golem);
     }
 
     public void markMenuClosed(java.util.UUID golemId) { openMenus.remove(golemId); }
@@ -170,8 +259,21 @@ public final class LavaGolemPlugin extends JavaPlugin {
 
     @Override
     public void onEnable() {
+        // Write a fresh config.yml if none exists, then add any keys THIS version introduced that an
+        // existing install's copy is missing -- saveDefaultConfig() alone only ever writes the file
+        // once, so without this step every option added after someone's first install stays invisible
+        // to them forever. reloadConfig() re-reads the file ConfigMigrator just appended to, since it
+        // edits config.yml on disk directly rather than going through the cached in-memory copy; both
+        // have to happen before PluginConfig reads a single value out of getConfig().
+        saveDefaultConfig();
+        ConfigMigrator.migrate(this);
+        reloadConfig();
         cfg = new PluginConfig(this);
         msg = new Messages(this);
+        // Created regardless of golemdebug-output so a mid-session config reload isn't needed to
+        // start using file tracing — an unused GolemDebugLog just flushes an empty queue every tick.
+        debugLog = new GolemDebugLog(this);
+        debugLog.start();
 
         heartItemKey     = new NamespacedKey(this, "golem_heart");
         heartRoleKey     = new NamespacedKey(this, "heart_role");
@@ -199,6 +301,10 @@ public final class LavaGolemPlugin extends JavaPlugin {
             new org.bstats.bukkit.Metrics(this, 31068);
         }
 
+        // Reads server tags, so it has to happen here on the main thread — the pathfinding worker
+        // only ever consults the finished set.
+        io.github.pushkindesu.lavagolem.nav.NavMesh.initNonFloorMaterials();
+
         buildSmeltableInputs();
         // Only register a role's recipe if it's enabled — a disabled golem can't be crafted.
         if (cfg.enableLava) registerHeartRecipe();
@@ -210,11 +316,16 @@ public final class LavaGolemPlugin extends JavaPlugin {
         courierMenu = new CourierMenu(this);
         alchemistMenu = new AlchemistMenu(this);
         tagPrompt = new TagPrompt(this);
+        navMesh = new io.github.pushkindesu.lavagolem.nav.NavMesh(cfg.navChunkCacheSeconds);
+        navigation = new io.github.pushkindesu.lavagolem.nav.Navigation(this, navMesh);
+
         getServer().getPluginManager().registerEvents(new HeartUseListener(this), this);
         getServer().getPluginManager().registerEvents(golemMenu, this);
         getServer().getPluginManager().registerEvents(courierMenu, this);
         getServer().getPluginManager().registerEvents(alchemistMenu, this);
         getServer().getPluginManager().registerEvents(tagPrompt, this);
+        getServer().getPluginManager().registerEvents(
+                new io.github.pushkindesu.lavagolem.nav.NavMeshListener(navMesh, navigation), this);
 
         getCommand("removegolems").setExecutor((sender, command, label, args) -> {
             int count = 0;
@@ -233,25 +344,77 @@ public final class LavaGolemPlugin extends JavaPlugin {
 
         getCommand("golemdebug").setExecutor((sender, command, label, args) -> {
             if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("In-game only."); return true; }
-            Mob nearest = null;
-            double best = Double.MAX_VALUE;
-            for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
-                if (!(e instanceof Mob m)) continue;
-                if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
-                double d = e.getLocation().distanceSquared(p.getLocation());
-                if (d < best) { best = d; nearest = m; }
-            }
-            if (nearest == null) {
-                p.sendMessage(Component.text("No golem within 12 blocks.", NamedTextColor.RED));
+
+            // No argument: the original behaviour, unchanged — walk up to a golem and toggle it.
+            if (args.length == 0) {
+                Mob nearest = null;
+                double best = Double.MAX_VALUE;
+                for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
+                    if (!(e instanceof Mob m)) continue;
+                    if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                    double d = e.getLocation().distanceSquared(p.getLocation());
+                    if (d < best) { best = d; nearest = m; }
+                }
+                if (nearest == null) {
+                    p.sendMessage(Component.text("No golem within 12 blocks.", NamedTextColor.RED));
+                    return true;
+                }
+                if (debugWatchers.remove(nearest.getUniqueId()) != null) {
+                    p.sendMessage(Component.text("Debug OFF for the nearest golem.", NamedTextColor.YELLOW));
+                    logDebugToggleMarker(nearest, false, p);
+                } else {
+                    debugWatchers.put(nearest.getUniqueId(), p.getUniqueId());
+                    p.sendMessage(Component.text("Debug ON for the nearest golem — "
+                            + debugOutputHint() + ".", NamedTextColor.GREEN));
+                    logDebugToggleMarker(nearest, true, p);
+                }
                 return true;
             }
-            if (debugWatchers.remove(nearest.getUniqueId()) != null) {
-                p.sendMessage(Component.text("Debug OFF for the nearest golem.", NamedTextColor.YELLOW));
+
+            // "all": every golem on the server, including ones that spawn later — a separate flag
+            // rather than one debugWatchers entry per golem, so it doesn't need re-arming as new
+            // golems appear and doesn't need enumerating the whole server just to switch it off.
+            if (args[0].equalsIgnoreCase("all")) {
+                if (debugAllWatcher != null) {
+                    debugAllWatcher = null;
+                    p.sendMessage(Component.text("Debug OFF for all golems.", NamedTextColor.YELLOW));
+                    logDebugBroadMarker("ALL golems", false, p, 0);
+                } else {
+                    debugAllWatcher = p.getUniqueId();
+                    int count = countGolems(null);
+                    p.sendMessage(Component.text("Debug ON for ALL golems (" + count
+                            + " currently) — " + debugOutputHint() + ".", NamedTextColor.GREEN));
+                    logDebugBroadMarker("ALL golems", true, p, count);
+                }
+                return true;
+            }
+
+            // A specific role, e.g. "courier" or "couriers" — same idea as "all" but scoped down.
+            String role = resolveDebugRole(args[0]);
+            if (role == null) {
+                p.sendMessage(Component.text("Unknown golem role '" + args[0]
+                        + "'. Use: all, lava_hauler, smelter, courier, alchemist, fisher.", NamedTextColor.RED));
+                return true;
+            }
+            if (debugRoleWatchers.remove(role) != null) {
+                p.sendMessage(Component.text("Debug OFF for role " + role + ".", NamedTextColor.YELLOW));
+                logDebugBroadMarker("role " + role, false, p, 0);
             } else {
-                debugWatchers.put(nearest.getUniqueId(), p.getUniqueId());
-                p.sendMessage(Component.text("Debug ON for the nearest golem — watch chat.", NamedTextColor.GREEN));
+                debugRoleWatchers.put(role, p.getUniqueId());
+                int count = countGolems(role);
+                p.sendMessage(Component.text("Debug ON for role " + role + " (" + count
+                        + " currently) — " + debugOutputHint() + ".", NamedTextColor.GREEN));
+                logDebugBroadMarker("role " + role, true, p, count);
             }
             return true;
+        });
+        getCommand("golemdebug").setTabCompleter((sender, command, alias, args) -> {
+            if (args.length != 1) return List.of();
+            String prefix = args[0].toLowerCase(Locale.ROOT);
+            List<String> options = List.of("all", "lava_hauler", "smelter", "courier", "alchemist", "fisher");
+            List<String> out = new ArrayList<>();
+            for (String o : options) if (o.startsWith(prefix)) out.add(o);
+            return out;
         });
 
         getCommand("golemstats").setExecutor((sender, command, label, args) -> {
@@ -298,6 +461,10 @@ public final class LavaGolemPlugin extends JavaPlugin {
         });
 
         golemTicker = new GolemTicker(this);
+        // Navigation traces through GolemTicker's existing /golemdebug machinery rather than
+        // duplicating it -- wired here since GolemTicker (and its debugWatchers plumbing) only exists
+        // from this point on.
+        navigation.setTracer(golemTicker::traceFromNav);
         golemTicker.runTaskTimer(this, 20L, cfg.tickPeriod);
 
         getLogger().info("LavaGolem enabled.");
@@ -305,6 +472,14 @@ public final class LavaGolemPlugin extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        // Stops the periodic drain and does one last synchronous flush so the tail of whatever was
+        // being traced when the server stopped actually makes it to disk instead of being lost.
+        if (debugLog != null) debugLog.shutdown();
+
+        // The nav worker pool holds daemon threads, so the JVM wouldn't hang on them regardless —
+        // but shutting it down explicitly means a /reload doesn't quietly accumulate a second pool.
+        if (navigation != null) navigation.shutdown();
+
         // Every recipe we add must be removed here, or a /reload leaves the old one registered and
         // addRecipe rejects the new one as a duplicate key — the heart then silently stops crafting.
         Bukkit.removeRecipe(new NamespacedKey(this, "golem_heart_recipe"));
