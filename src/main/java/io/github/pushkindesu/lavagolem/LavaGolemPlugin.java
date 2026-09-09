@@ -51,6 +51,9 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public NamespacedKey treasureFlagKey;
     public NamespacedKey courierRoutesKey;
     public NamespacedKey createdAtKey;
+    /** UUID of the player who placed this golem, stored as a STRING. Absent on a legacy golem placed
+     *  before ownership existed (or on one never claimed via /golemclaim) -- see {@link #ownerOf}. */
+    public NamespacedKey ownerKey;
     /** Set when a player has paused this golem from its menu; the ticker then leaves it alone. */
     public NamespacedKey pausedKey;
     /** Ingredients the alchemist is told NOT to use (absent = brew everything in the chest). */
@@ -184,6 +187,34 @@ public final class LavaGolemPlugin extends JavaPlugin {
         return cfg.enableLava; // hauler / default
     }
 
+    /** The UUID of the player who placed this golem, or null for an unowned/legacy golem -- one placed
+     *  before ownership existed, or never claimed via /golemclaim. Unowned golems are usable by
+     *  anyone, exactly as every golem worked before ownership was added -- see HeartUseListener's
+     *  spawnLavaGolem and onGolemInteract, and ProtectionManager#canAccess. */
+    public UUID ownerOf(org.bukkit.entity.Mob golem) {
+        String s = golem.getPersistentDataContainer().get(ownerKey, PersistentDataType.STRING);
+        if (s == null) return null;
+        try {
+            return UUID.fromString(s);
+        } catch (IllegalArgumentException e) {
+            return null; // corrupt value -- treat exactly like "no owner" rather than throwing
+        }
+    }
+
+    /** How many golems (any role, any world currently loaded) already belong to this player -- the
+     *  count max-golems-per-player is checked against at placement time. O(entities), but placement is
+     *  rare, so scanning every loaded world costs nothing noticeable. */
+    public int countOwnedGolems(UUID owner) {
+        int n = 0;
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity e : world.getEntitiesByClass(Mob.class)) {
+                if (!e.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                if (owner.equals(ownerOf((Mob) e))) n++;
+            }
+        }
+        return n;
+    }
+
     /** Smelter work modes (configurable per-golem via its GUI). */
     public static final String MODE_BALANCED = "BALANCED";
     public static final String MODE_LOAD_ONLY = "LOAD_ONLY";
@@ -222,6 +253,7 @@ public final class LavaGolemPlugin extends JavaPlugin {
     public GolemTicker golemTicker;
     public io.github.pushkindesu.lavagolem.nav.NavMesh navMesh;
     public io.github.pushkindesu.lavagolem.nav.Navigation navigation;
+    public io.github.pushkindesu.lavagolem.protection.ProtectionManager protection;
 
     /** Golems whose settings menu is currently open. The ticker holds any such golem still, whatever
      *  its role, so it doesn't wander off (or act on a half-configured route) while you're in its menu. */
@@ -296,6 +328,11 @@ public final class LavaGolemPlugin extends JavaPlugin {
         }
         courierRoutesKey = new NamespacedKey(this, "courier_routes");
         createdAtKey     = new NamespacedKey(this, "created_at");
+        ownerKey         = new NamespacedKey(this, "owner");
+
+        // Registers GriefPrevention/WorldGuard hooks only if those plugins are actually enabled, each
+        // in its own try/catch -- a server with neither installed starts and behaves exactly as before.
+        protection = new io.github.pushkindesu.lavagolem.protection.ProtectionManager(this);
 
         if (cfg.bstats) {
             new org.bstats.bukkit.Metrics(this, 31068);
@@ -457,6 +494,34 @@ public final class LavaGolemPlugin extends JavaPlugin {
                     .append(Component.text(msg.get("total-caught"), NamedTextColor.GRAY))
                     .append(Component.text(totalCaught, NamedTextColor.WHITE))
                     .build());
+            return true;
+        });
+
+        getCommand("golemclaim").setExecutor((sender, command, label, args) -> {
+            if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("In-game only."); return true; }
+
+            // Nearest golem overall (owned or not) within 12 blocks -- same search shape as
+            // /golemdebug's no-argument form, so the two commands feel consistent to use.
+            Mob nearest = null;
+            double best = Double.MAX_VALUE;
+            for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
+                if (!(e instanceof Mob m)) continue;
+                if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                double d = e.getLocation().distanceSquared(p.getLocation());
+                if (d < best) { best = d; nearest = m; }
+            }
+            if (nearest == null) {
+                p.sendMessage(Component.text(msg.get("golemclaim-none"), NamedTextColor.RED));
+                return true;
+            }
+            if (ownerOf(nearest) != null) {
+                // Refuse politely rather than silently reassigning it -- an already-owned golem is
+                // someone's working station, not migration material.
+                p.sendMessage(Component.text(msg.get("golemclaim-already-owned"), NamedTextColor.RED));
+                return true;
+            }
+            nearest.getPersistentDataContainer().set(ownerKey, PersistentDataType.STRING, p.getUniqueId().toString());
+            p.sendMessage(Component.text(msg.get("golemclaim-success"), NamedTextColor.GREEN));
             return true;
         });
 

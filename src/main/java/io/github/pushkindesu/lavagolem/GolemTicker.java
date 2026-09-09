@@ -381,6 +381,26 @@ public class GolemTicker extends BukkitRunnable {
         lastProblem.remove(golem.getUniqueId());
     }
 
+    /**
+     * Single choke point every arrival handler goes through to get at the container it just walked
+     * up to: null when the block isn't a container at all, OR when it is one but the golem's owner
+     * isn't allowed to touch it (see {@code plugin.protection}). Denial reuses exactly the same null
+     * result each handler already handles as "the container is gone" -- an already item-safe path
+     * (hold the carried item and idle, or retry) -- so routing protection through here can never open
+     * a new way to lose one; only the reason recorded via setLastProblem is new. Deliberately NOT
+     * called from any search/scan code: consulting a protection plugin for every candidate of a cube
+     * scan would be far too expensive, so a scan stays optimistic and a golem may occasionally walk
+     * all the way to a container it turns out isn't allowed to touch, discovering that right here.
+     */
+    private Container containerFor(Mob golem, Block block) {
+        if (!(block.getState() instanceof Container c)) return null;
+        if (!plugin.protection.canAccess(golem, block)) {
+            setLastProblem(golem, "not allowed to access this container here");
+            return null;
+        }
+        return c;
+    }
+
     /** Core decision engine: picks the single best action for an idle smelter golem. */
     private void smelterDecide(Mob golem) {
         if (!canSearch(golem)) return;
@@ -780,7 +800,8 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void onReachOutputChest(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
             clearSearchCooldown(golem);
             setSmelterState(golem, "SMELTER_IDLE");
             return;
@@ -893,7 +914,8 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void onReachReturnBucket(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
             clearSearchCooldown(golem);
             setSmelterState(golem, "SMELTER_IDLE");
             return;
@@ -915,7 +937,8 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void onReachFuelChest(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
             clearJobFurnace(golem);
             setSmelterState(golem, "SMELTER_IDLE");
             return;
@@ -1010,7 +1033,8 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void onReachInputChest(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
             clearJobFurnace(golem);
             setSmelterState(golem, "SMELTER_IDLE");
             return;
@@ -1352,8 +1376,8 @@ public class GolemTicker extends BukkitRunnable {
         String job = golem.getPersistentDataContainer()
                 .getOrDefault(alchemyJobKey, PersistentDataType.STRING, JOB_INGREDIENT);
         // Grinding restocks the chest itself, so it's the one job with no stand attached.
-        if (want == null || !(block.getState() instanceof Container chest)
-                || (stand == null && !JOB_GRIND.equals(job))) {
+        Container chest = containerFor(golem, block);
+        if (want == null || chest == null || (stand == null && !JOB_GRIND.equals(job))) {
             abortAlchemy(golem);
             return;
         }
@@ -1516,7 +1540,8 @@ public class GolemTicker extends BukkitRunnable {
             setAlchemistState(golem, "ALCHEMIST_IDLE");
             return;
         }
-        if (!(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
             setAlchemistState(golem, "ALCHEMIST_IDLE");
             return;
         }
@@ -1995,7 +2020,8 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void onReachRodsChest(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) { abortFisher(golem); return; }
+        Container chest = containerFor(golem, block);
+        if (chest == null) { abortFisher(golem); return; }
         int slot = takeableRodSlot(chest);
         if (slot < 0) { abortFisher(golem); return; }
         ItemStack rod = chest.getInventory().getItem(slot);
@@ -2297,7 +2323,8 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void onReachFisherOutput(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) { abortFisher(golem); return; }
+        Container chest = containerFor(golem, block);
+        if (chest == null) { abortFisher(golem); return; }
         ItemStack carried = golem.getEquipment().getItemInMainHand();
         if (carried == null || carried.getType() == Material.AIR) {
             setFisherState(golem, "FISHER_IDLE");
@@ -2556,7 +2583,8 @@ public class GolemTicker extends BukkitRunnable {
     private void onReachCourierSource(Mob golem, Block block) {
         CourierRoute route = activeCourierRoute(golem);
         Location dest = getCourierDest(golem);
-        if (route == null || dest == null || !(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (route == null || dest == null || chest == null) {
             abortCourier(golem);
             return;
         }
@@ -2571,8 +2599,10 @@ public class GolemTicker extends BukkitRunnable {
         ItemStack hand = golem.getEquipment().getItemInMainHand();
         if (hand == null || hand.getType() == Material.AIR) { abortCourier(golem); return; }
 
-        if (!(block.getState() instanceof Container chest)) {
-            // Destination gone — re-find by the active route's dest tag; else hold (IDLE net retries).
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
+            // Destination gone (or access denied) — re-find by the active route's dest tag; else hold
+            // (IDLE net retries).
             CourierRoute route = activeCourierRoute(golem);
             Block redo = (route != null)
                     ? findCourierDest(golem.getLocation(), route.dest, plugin.cfg.courierSearchRadius) : null;
@@ -3283,7 +3313,8 @@ public class GolemTicker extends BukkitRunnable {
     // ===== ON REACH =====
 
     private void onReachBucketChest(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
             clearSearchCooldown(golem);
             setState(golem, "SEEKING_BUCKET");
             return;
@@ -3321,7 +3352,8 @@ public class GolemTicker extends BukkitRunnable {
     }
 
     private void onReachLavaChest(Mob golem, Block block) {
-        if (!(block.getState() instanceof Container chest)) {
+        Container chest = containerFor(golem, block);
+        if (chest == null) {
             clearSearchCooldown(golem);
             setState(golem, "SEEKING_LAVA_CHEST");
             return;

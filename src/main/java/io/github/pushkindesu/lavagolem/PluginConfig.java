@@ -16,6 +16,12 @@ public class PluginConfig {
      *  courier tracing unattended and read the result later instead of watching chat live. */
     public enum DebugOutput { CHAT, FILE, BOTH }
 
+    /** How container protection behaves when a golem's owner cannot be reached to ask live — see
+     *  ProtectionManager#canAccess. CACHED trusts the last verdict recorded while the owner was
+     *  online (or allows, if there is none); STRICT refuses whatever it cannot verify; OFF performs
+     *  no checks at all (today's behaviour). */
+    public enum ProtectionMode { CACHED, STRICT, OFF }
+
     public final int searchRadius;
     public final double reachDistance;
     public final long searchCooldownTicks;
@@ -60,6 +66,9 @@ public class PluginConfig {
     public final int navSearchMargin;
     public final int navMaxLegBlocks;
     public final int navMoveRefusedTicks;
+    public final int maxGolemsPerPlayer;
+    public final ProtectionMode protectionMode;
+    public final long protectionCacheSeconds;
 
     public PluginConfig(LavaGolemPlugin plugin) {
         // saveDefaultConfig(), ConfigMigrator.migrate(), and reloadConfig() have already run by the
@@ -192,6 +201,28 @@ public class PluginConfig {
         // sitting on it for the full distance-based window only wastes the golem's time and blames the
         // wrong leg: the golem never actually attempted the one the timer eventually penalises.
         this.navMoveRefusedTicks = Math.max(2, Math.min(40, c.getInt("nav-move-refused-ticks", 4)));
+
+        // 0 = unlimited. Counted at placement time by scanning loaded worlds for golems this player
+        // already owns (see LavaGolemPlugin#countOwnedGolems) -- rare enough (only on placement) that
+        // an O(entities) scan costs nothing noticeable.
+        this.maxGolemsPerPlayer = Math.max(0, c.getInt("max-golems-per-player", 0));
+
+        // Same warn-and-fall-back pattern as golemdebug-output above: a typo here silently disabling
+        // real protection would be far worse than one startup warning.
+        String rawProtectionMode = c.getString("protection-mode", "cached");
+        ProtectionMode parsedProtectionMode;
+        switch (rawProtectionMode == null ? "" : rawProtectionMode.trim().toLowerCase(Locale.ROOT)) {
+            case "cached" -> parsedProtectionMode = ProtectionMode.CACHED;
+            case "strict" -> parsedProtectionMode = ProtectionMode.STRICT;
+            case "off" -> parsedProtectionMode = ProtectionMode.OFF;
+            default -> {
+                plugin.getLogger().warning("protection-mode '" + rawProtectionMode
+                        + "' is not one of cached/strict/off, using cached instead.");
+                parsedProtectionMode = ProtectionMode.CACHED;
+            }
+        }
+        this.protectionMode = parsedProtectionMode;
+        this.protectionCacheSeconds = Math.max(5, c.getLong("protection-cache-seconds", 300));
     }
 
     /** Reads the optional fisher-custom-catches list. Each entry adds an item to one loot pool

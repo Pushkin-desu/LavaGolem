@@ -22,6 +22,17 @@
             <id>codemc-repo</id>
             <url>https://repo.codemc.io/repository/maven-public/</url>
         </repository>
+        <!-- WorldGuard's own repository (see https://worldguard.enginehub.org/en/latest/developer/dependency/) -->
+        <repository>
+            <id>enginehub-maven</id>
+            <url>https://maven.enginehub.org/repo/</url>
+        </repository>
+        <!-- GriefPrevention has no repository of its own; JitPack builds a Maven artifact straight
+             from its GitHub releases. -->
+        <repository>
+            <id>jitpack.io</id>
+            <url>https://jitpack.io</url>
+        </repository>
     </repositories>
 
     <dependencies>
@@ -36,6 +47,24 @@
             <artifactId>bstats-bukkit</artifactId>
             <version>3.0.2</version>
             <scope>compile</scope>
+        </dependency>
+        <!-- Protection hooks (see io.github.pushkindesu.lavagolem.protection): both are compile-time
+             only, provided scope, never shaded into the jar, and are only ever touched at runtime
+             if the corresponding plugin is actually installed and enabled (ProtectionManager checks
+             isPluginEnabled before constructing either hook, in its own try/catch). Compile-time typing
+             against the real API is worth the two extra build entries; a server with neither plugin
+             installed still starts and runs exactly as before. -->
+        <dependency>
+            <groupId>com.sk89q.worldguard</groupId>
+            <artifactId>worldguard-bukkit</artifactId>
+            <version>7.0.12</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.github.GriefPrevention</groupId>
+            <artifactId>GriefPrevention</artifactId>
+            <version>16.18.7</version>
+            <scope>provided</scope>
         </dependency>
     </dependencies>
 

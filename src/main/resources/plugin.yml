@@ -5,6 +5,7 @@ api-version: '1.21'
 authors: [Pushkin-desu]
 website: https://github.com/Pushkin-desu/LavaGolem
 description: Automated lava-fetching golems for survival servers.
+softdepend: [GriefPrevention, WorldGuard]
 commands:
   removegolems:
     description: Remove all lava golems from the server
@@ -15,7 +16,25 @@ commands:
   golemdebug:
     description: Toggle live decision tracing. No args = nearest golem; "all" = every golem; a role name (lava_hauler/smelter/courier/alchemist/fisher) = every golem of that role
     permission: lavagolem.admin
+  golemclaim:
+    description: Claim the nearest unowned golem within 12 blocks
+    permission: lavagolem.admin
 permissions:
   lavagolem.admin:
     description: Administrative commands for LavaGolem
+    default: op
+  lavagolem.craft:
+    description: Craft a Golem Heart
+    default: true
+  lavagolem.place:
+    description: Place a Golem Heart to spawn a golem
+    default: true
+  lavagolem.use:
+    description: Use your own golems -- menu, tags, routes, disassembly
+    default: true
+  lavagolem.use.others:
+    description: Use a golem owned by someone else
+    default: op
+  lavagolem.limit.bypass:
+    description: Ignore max-golems-per-player
     default: op

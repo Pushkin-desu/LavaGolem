@@ -15,6 +15,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.block.Action;
+import org.bukkit.event.inventory.PrepareItemCraftEvent;
 import org.bukkit.event.player.PlayerInteractAtEntityEvent;
 import org.bukkit.event.player.PlayerInteractEntityEvent;
 import org.bukkit.event.player.PlayerInteractEvent;
@@ -23,6 +24,9 @@ import org.bukkit.event.world.EntitiesUnloadEvent;
 import org.bukkit.inventory.EquipmentSlot;
 import org.bukkit.inventory.ItemStack;
 import org.bukkit.persistence.PersistentDataType;
+
+import java.util.Map;
+import java.util.UUID;
 
 
 public class HeartUseListener implements Listener {
@@ -60,14 +64,48 @@ public class HeartUseListener implements Listener {
             return;
         }
 
+        // lavagolem.place gates placing at all (default true); refusing here leaves the heart in
+        // hand, exactly like a disabled role above, rather than silently consuming it.
+        if (!player.hasPermission("lavagolem.place")) {
+            player.sendMessage(Component.text(plugin.msg.get("no-permission-place"), NamedTextColor.RED));
+            return;
+        }
+
+        // max-golems-per-player (0 = unlimited) is counted at placement time by scanning every loaded
+        // world for golems this player already owns. Refusing must NOT consume the heart -- the
+        // player did nothing wrong, the server just has a cap.
+        int limit = plugin.cfg.maxGolemsPerPlayer;
+        if (limit > 0 && !player.hasPermission("lavagolem.limit.bypass")
+                && plugin.countOwnedGolems(player.getUniqueId()) >= limit) {
+            player.sendMessage(Component.text(
+                    plugin.msg.get("golem-limit-reached", Map.of("limit", String.valueOf(limit))),
+                    NamedTextColor.RED));
+            return;
+        }
+
         Location loc = event.getClickedBlock().getLocation().add(0.5, 1.0, 0.5);
-        spawnLavaGolem(loc, role);
+        spawnLavaGolem(loc, role, player);
 
         if (player.getGameMode() != GameMode.CREATIVE) {
             item.setAmount(item.getAmount() - 1);
         }
 
         player.sendMessage(Component.text(plugin.msg.get("golem-spawned"), NamedTextColor.GOLD));
+    }
+
+    /**
+     * Blanks a Golem Heart's crafted result for a player who lacks lavagolem.craft, rather than
+     * unregistering the recipe outright -- the recipe book still shows the shape/ingredients to
+     * everyone, only the assembled item itself is withheld from someone not allowed to have it.
+     */
+    @EventHandler
+    public void onPrepareCraft(PrepareItemCraftEvent event) {
+        ItemStack result = event.getInventory().getResult();
+        if (result == null || !result.hasItemMeta()) return;
+        if (!result.getItemMeta().getPersistentDataContainer().has(plugin.heartItemKey, PersistentDataType.BYTE)) return;
+        if (event.getView().getPlayer() instanceof Player player && !player.hasPermission("lavagolem.craft")) {
+            event.getInventory().setResult(null);
+        }
     }
 
     private static String initialState(String role) {
@@ -92,7 +130,7 @@ public class HeartUseListener implements Listener {
         return role == null || LavaGolemPlugin.ROLE_HAULER.equals(role);
     }
 
-    private void spawnLavaGolem(Location loc, String role) {
+    private void spawnLavaGolem(Location loc, String role, Player owner) {
         CopperGolem golem = (CopperGolem) loc.getWorld().spawnEntity(loc, EntityType.COPPER_GOLEM);
 
         // Set all PDC tags first (before any other Paper/CraftBukkit calls)
@@ -100,6 +138,11 @@ public class HeartUseListener implements Listener {
                 plugin.golemEntityKey, PersistentDataType.BYTE, (byte) 1);
         golem.getPersistentDataContainer().set(
                 plugin.roleKey, PersistentDataType.STRING, role);
+        // Ownership is established here, by placing -- NOT stamped on the heart item, which stays
+        // freely tradeable. A golem placed this way is never "legacy": see ProtectionManager and
+        // onGolemInteract's owner/lavagolem.use.others gate below.
+        golem.getPersistentDataContainer().set(
+                plugin.ownerKey, PersistentDataType.STRING, owner.getUniqueId().toString());
         golem.getPersistentDataContainer().set(
                 new NamespacedKey(plugin, "state"),
                 PersistentDataType.STRING, initialState(role));
@@ -246,7 +289,12 @@ public class HeartUseListener implements Listener {
 
         if (player.isSneaking()
                 && player.getInventory().getItemInMainHand().getType() == Material.AIR) {
-            // Sneak + empty hand = disassemble
+            // Sneak + empty hand = disassemble. Gated exactly like opening the menu below — an
+            // unowned (legacy) golem stays fair game for anyone, same as before ownership existed.
+            if (!canOperate(player, golem)) {
+                player.sendMessage(Component.text(plugin.msg.get("golem-not-yours"), NamedTextColor.RED));
+                return;
+            }
             String role = golem.getPersistentDataContainer().getOrDefault(
                     plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
             golem.getWorld().dropItemNaturally(golem.getLocation(), plugin.createGolemHeart(role));
@@ -266,6 +314,10 @@ public class HeartUseListener implements Listener {
         } else if (!player.isSneaking()
                 && player.getInventory().getItemInMainHand().getType() == Material.AIR) {
             // Empty hand (no sneak): open the golem's GUI (courier = routes, others = stats/settings).
+            if (!canOperate(player, golem)) {
+                player.sendMessage(Component.text(plugin.msg.get("golem-not-yours"), NamedTextColor.RED));
+                return;
+            }
             String role = golem.getPersistentDataContainer().getOrDefault(
                     plugin.roleKey, PersistentDataType.STRING, LavaGolemPlugin.ROLE_HAULER);
             if (LavaGolemPlugin.ROLE_COURIER.equals(role)) {
@@ -277,6 +329,19 @@ public class HeartUseListener implements Listener {
                 plugin.golemMenu.open(player, golem);
             }
         }
+    }
+
+    /**
+     * Whether {@code player} may open this golem's menu or disassemble it: the owner (with
+     * lavagolem.use), anyone with lavagolem.use.others, or — since a legacy golem placed before
+     * ownership existed must keep working for everyone, exactly as it always has — anyone at all when
+     * the golem has no owner.
+     */
+    private boolean canOperate(Player player, Mob golem) {
+        UUID owner = plugin.ownerOf(golem);
+        if (owner == null) return true;
+        if (player.hasPermission("lavagolem.use.others")) return true;
+        return owner.equals(player.getUniqueId()) && player.hasPermission("lavagolem.use");
     }
 
     /** Cancel-only twin of {@link #onGolemInteract(PlayerInteractEntityEvent)} — see that method's
