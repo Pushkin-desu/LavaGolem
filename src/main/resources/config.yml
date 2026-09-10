@@ -105,9 +105,6 @@ waypoint-sign-text: "[Waypoint]"
 # running since before real pathfinding existed may have geometry that genuinely can't be walked at
 # all; if that's you, true re-enables the old blink-past-it behaviour.
 courier-teleport: false
-# Logic ticks of no path progress before the courier teleports toward its target
-# (a logic tick is `tick-period` game ticks; at the default that's ~0.5s, so 20 = ~10s).
-courier-stuck-ticks: 20
 
 # --- Navigation (long-distance walking) ---
 # Every golem now plans its walk with its own pathfinder over a cached map of "where can I stand"
@@ -199,8 +196,8 @@ locale: en
 bstats: true
 
 # --- Debug tracing ---
-# /golemdebug narrates a golem's decisions (and, for a courier, its pathfinding) live. This setting
-# controls where those lines go:
+# /lavagolem debug narrates a golem's decisions (and, for a courier, its pathfinding) live. This
+# setting controls where those lines go:
 #   chat - only into the toggling player's chat, same as before. Fine for standing next to a golem
 #          and watching it decide, but useless once you walk away or log off.
 #   file - only into plugins/LavaGolem/golemdebug.log (created on demand, rotated past 5MB). Nothing
@@ -210,3 +207,43 @@ bstats: true
 # The file is written off the main thread, so tracing several golems at once never costs server tick
 # time the way writing it inline would. Anything other than chat/file/both is warned about and treated
 # as chat.
+golemdebug-output: chat
+
+
+# --- Ownership & golem cap ---
+# Placing a Golem Heart makes the placing player that golem's owner (the heart item itself is never
+# tagged, so hearts stay freely tradeable -- only placing one establishes ownership). A golem placed
+# before this feature existed has no owner and keeps working for anyone, exactly as it always did;
+# /golemclaim (lavagolem.admin) lets an admin assign one to migrate an old station without rebuilding
+# it. Owning a golem only matters for who may open its menu/disassemble it (lavagolem.use.others
+# bypasses this) and, if a protection plugin is installed, which containers it may touch below.
+# Maximum golems a single player may have placed at once (0 = unlimited). Checked at placement time
+# by counting golems this player already owns across every loaded world; a player with
+# lavagolem.limit.bypass ignores it. Placing beyond the limit is refused and the heart is NOT
+# consumed.
+max-golems-per-player: 0
+
+# --- Container protection ---
+# Golems read and write chest/barrel/etc inventories directly, which by itself is invisible to
+# GriefPrevention, WorldGuard, or any other claim/region plugin -- nothing stops a golem from being
+# placed next to someone else's containers and routed to move their stuff. This plugin checks BOTH
+# GriefPrevention (claims + container trust) and WorldGuard (the CHEST_ACCESS region flag) when
+# either is installed, plus a generic check (a normal, cancellable interact event fired as the owner)
+# that lets most other protection plugins veto access too -- every one of these that's actually
+# installed must agree before a golem is allowed to touch a container. This only ever applies to an
+# OWNED golem (see above); a legacy, unowned golem is never protection-checked, matching how it
+# already worked before this existed.
+# What to do when a golem's owner can't be reached to ask live (they're offline, and the only way to
+# check is the generic event hook above, which needs a real online player to fire as):
+#   cached - trust the last answer recorded while the owner was online; with nothing recorded yet,
+#            allow. Stations keep running overnight, and a claim rarely changes minute to minute.
+#   strict - refuse whatever can't be verified right now. Safe, but a golem's station goes quiet
+#            the moment its owner logs off.
+#   off     - no container checks at all (the plugin's original behaviour, before ownership existed).
+# Note: GriefPrevention and WorldGuard can both be asked even while the owner is offline (that's the
+# whole point of a claim/region system), so installing either gives you real round-the-clock
+# protection regardless of this setting -- it only governs the fallback when neither is installed.
+protection-mode: cached
+# How long (in seconds) a container's last checked verdict is trusted as the offline fallback above,
+# before being treated as if nothing had ever been recorded.
+protection-cache-seconds: 300

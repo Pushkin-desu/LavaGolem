@@ -8,6 +8,7 @@ Everything about setting the golems up, and what to do when a courier won't move
 ## Table of contents
 
 - [Common rules](#common-rules)
+- [Ownership, permissions & protection](#ownership-permissions--protection)
 - [🪣 Lava Golem](#-lava-golem)
 - [🔥 Smelter Golem](#-smelter-golem)
 - [⚗️ Alchemist Golem](#️-alchemist-golem)
@@ -39,6 +40,46 @@ These apply to every golem.
   - Watch out for a stray **trailing space** in a container's name: it's invisible in-game but makes the tag not match.
 - **Range.** Golems look for their containers within `search-radius` (default 8 blocks) of where they currently stand. The courier is the exception — it has its own, larger `courier-search-radius`.
 - **Restarts.** A golem's role, current job, work mode and courier routes are all saved and restored when its chunk loads.
+
+---
+
+## Ownership, permissions & protection
+
+**Placing a Heart makes you the owner.** The Heart item itself is never tagged, so hearts stay freely tradeable — it's the act of right-clicking the ground with one that assigns ownership to whoever placed it. A golem placed before this existed (anything from before 1.1.0) has no owner and keeps working for anyone, exactly as it always did — nothing changes for an existing base until you touch it.
+
+**Owning a golem controls who can use it.** Opening its menu, retagging its containers, editing courier routes, switching it off, disassembling it — all of that needs to be the owner, or a player with `lavagolem.use.others`. An unowned (legacy) golem skips this check entirely, same as before.
+
+**Migrating an old base.** There are two ways to give a pre-1.1.0 golem an owner, and they are not equivalent:
+- **`/lavagolem claim`** (needs `lavagolem.admin`) adopts the *nearest unowned golem within 12 blocks in place* — same entity, same stats, same custom container tags, same work mode, now with an owner.
+- **Disassembling it and placing a fresh Heart** also works, but it's a *new* golem: counters reset to zero, custom tags are gone, courier routes have to be rebuilt from scratch.
+
+If you're inheriting someone else's base, or adding ownership to golems you built before upgrading, `claim` is almost always the one you want — it's the only path that doesn't throw the golem's history away.
+
+**A cap on how many one player can place.** `max-golems-per-player` (default `0`, unlimited) is checked at placement time by counting every golem a player already owns, across every loaded world; `lavagolem.limit.bypass` ignores it. Hitting the cap doesn't consume the Heart — placement is simply refused, so you keep the item.
+
+**Permissions:**
+
+| Permission | Default | Lets a player... |
+|---|---|---|
+| `lavagolem.craft` | `true` | Craft a Golem Heart |
+| `lavagolem.place` | `true` | Place a Heart to spawn a golem |
+| `lavagolem.use` | `true` | Use golems they own — menu, tags, routes, disassembly |
+| `lavagolem.use.others` | `op` | Use a golem someone else owns |
+| `lavagolem.limit.bypass` | `op` | Ignore `max-golems-per-player` |
+| `lavagolem.admin` | `op` | Every `/lavagolem` subcommand (reload, stats, debug, claim, remove) |
+
+**Container protection.** Golems read and write chest/barrel/etc. inventories directly, which by itself is invisible to a claim or region plugin — nothing would otherwise stop someone's golem from being placed next to your containers and routed to help itself. This only ever applies to an **owned** golem; a legacy, unowned one is never protection-checked, matching how it worked before ownership existed.
+
+When GriefPrevention or WorldGuard is installed, the plugin asks it directly — GriefPrevention's claims and container trust, WorldGuard's `CHEST_ACCESS` region flag — and can get a real answer even while the golem's owner is offline, because that's the whole point of a claim/region system. A generic fallback also exists for other protection plugins: it fires a normal, cancellable interact event as the owner, which only works while the owner is online to fire it as.
+
+`protection-mode` decides what happens when nothing can answer live (no GriefPrevention/WorldGuard installed, and the owner is offline):
+- **`cached`** (default) — trust the last verdict recorded while the owner was online; with nothing recorded yet, allow. Good for stations that run unattended overnight.
+- **`strict`** — refuse anything that can't be verified right now. Safer, but a golem's station goes quiet the moment its owner logs off.
+- **`off`** — no container checks at all (the plugin's original behaviour, from before ownership existed).
+
+`protection-cache-seconds` (default `300`) is how long that cached verdict is trusted before being treated as unknown again.
+
+**Be aware:** the GriefPrevention and WorldGuard adapters have not been exercised on a live server running either plugin — the maintainer runs neither. Treat them as best-effort, not verified support. Every hook, adapter or generic, is held to the same rule regardless: a misbehaving one is never trusted blindly, so it can never wedge a golem — it's ignored on failure and switches itself off after enough repeated failures.
 
 ---
 
@@ -211,31 +252,32 @@ The status line also shows **Now:** — what the golem is doing this moment (idl
 
 ## How the courier finds its way
 
-The courier walks on its legs using Minecraft's normal mob pathfinding. That pathfinder has a **budget** — it only searches so many blocks outward — so for a long or awkward route (especially *up*, where it first has to walk *away* from the goal to reach the stairs) it can fail to find a path and just beeline into a wall.
+The courier plans its own route before it ever takes a step. Off the main server thread, it runs an A* search over a map the plugin builds of "where can I actually stand" for every chunk it's visited — not vanilla's raw pathfinder, and not player-placed markers. That search hands back a short list of turn points, and vanilla's own short-range steering walks each leg between them (it already handles stairs, doors and small gaps well, so there's no reason to reinvent that part).
 
-Two mechanisms handle that:
+A few things follow from that:
 
-### Waypoints (the good way)
+- **The search is bounded.** It only explores loaded chunks, within `nav-search-margin` blocks of the straight line to the target (default 32). That bound is what lets a golem ever conclude "there's genuinely no way through" instead of exploring forever — but it also means long-distance hauling across chunks nobody's loaded isn't something this plugin does. Keep routes inside the area you actually play in.
+- **A completed route is cached** by its start and end container, and replayed instantly on the next trip — no search at all. Digging or building near a cached route drops it from the cache immediately, so a rebuilt staircase or a newly-locked door takes effect on the courier's very next leg, not after some timeout.
+- **`[Waypoint]` signs are optional, not the mechanism.** They still do two real things: ground within a few blocks of one is cheaper for the search to route through, so a golem prefers a road you actually built over open ground when both would work; and if a search fails outright, the courier falls back to hopping marker-to-marker the way it always used to. You no longer need to lay them for an ordinary route — the golem finds its own way across open, walkable ground on its own. Lay them where you want to *bias* the golem onto a particular path (a bridge over a ravine, say) or as a safety net for a route the search can't otherwise solve.
 
-Place signs reading **`[Waypoint]`** (text configurable via `waypoint-sign-text`) along a walkable path — like breadcrumbs:
+**Placing waypoints.** Signs reading `[Waypoint]` (text configurable via `waypoint-sign-text`) still work the same way they always did — like breadcrumbs along the path you want to bias or fall back to:
 
-- one at the **bottom of the stairs**,
-- one on **each landing / turn**,
-- one **near the destination** at the top.
+- one near the bottom of a staircase,
+- one on each landing or turn,
+- one near the top, close to the destination.
 
-The courier then walks **marker to marker**. Each hop is a short, easy segment the pathfinder can solve, so it climbs stairs and rounds corners on foot.
+Markers are shared by every courier; each one judges distance against **its own** target, so one network of signs can bias or rescue routes for any number of couriers going in any direction — you never name or assign them to a particular golem.
 
-How it chooses the next marker, precisely:
+### When a route can't be walked
 
-1. Can it path **directly** to its target right now? If yes, it goes straight there and ignores the markers.
-2. If not, among the markers it hasn't passed yet this trip, it picks the one **closest to its target that it can actually reach**, and walks there.
-3. On arrival it re-checks step 1, and repeats.
+A golem that genuinely can't reach its target doesn't blink past the problem — it tells you:
 
-Because every courier judges markers against **its own** target, **one network of `[Waypoint]` signs serves any number of couriers going in any direction.** They're shared road signs, not per-golem assignments — you never name or assign them.
+1. Whatever it was carrying is **re-homed** back to a container instead of being stranded mid-route.
+2. **`(stuck)`** is appended to the golem's name, visible above its head — no menu needed to spot it from across the base.
+3. The courier's menu shows the **reason** in that route's status line.
+4. It **retries on a widening backoff** — short at first, longer each time it fails again — so once you fix the route (rebuild the stairs, clear the door, reopen a claim) it picks the job back up on its own, with no player action beyond fixing the actual problem.
 
-### Teleport (the fallback)
-
-If a target genuinely can't be reached on foot — no usable markers, path blocked — the courier **teleports** next to it as a last resort, after `courier-stuck-ticks` of no progress. You can turn this off with `courier-teleport: false` for pure-walking (survival-purist) routes; then routes must be short, walkable, or marked with waypoints.
+That's the intended way to play: leave `courier-teleport` at its default, **`false`**, and read `(stuck)` as the golem accurately reporting broken infrastructure rather than something to route around. Setting `courier-teleport: true` brings back the old blink-to-target behaviour — kept only for a server whose geometry genuinely can't be walked at all, not as the everyday answer to a stuck courier.
 
 ---
 
@@ -249,33 +291,49 @@ Open the menu and read the status line for that route (table above). A red statu
 **2. The containers are out of range.**
 `courier-search-radius` is measured **from where the golem is standing now**, and the **same in every direction** — the cube must cover *both* ends of the route. Default is 24. If your source and destination are 40 blocks apart, no radius will see both — move the golem between them or shorten the route. Note the radius is **capped at 32** even if you set it higher (a 65³ cube is already ~275k blocks; the scan cost grows as radius³, so bigger would stall the server).
 
-**3. It walks straight at the target and stops / teleports.**
-The pathfinder can't route there (usually the target is up stairs behind it). **Add `[Waypoint]` signs** along the walkable path — bottom of the stairs, each landing, near the top. See the section above. This is *the* fix for vertical / behind-me routes.
+**3. Its name says `(stuck)`, or the route status shows a reason.**
+The golem's own A* genuinely couldn't find a walkable route within `nav-search-margin` of the target — a closed door it reads as a wall, a drop bigger than `nav-max-step-down`, water it won't wade through, or simply nothing built between the two ends yet. Read the reason in the courier's menu, fix the actual obstacle, and the golem picks the route back up on its own within a few retries — no need to re-place it or reset anything. If a path is legitimately walkable but the search struggles to find it (a maze of choices, say), a few `[Waypoint]` signs along the route you want will bias the search onto it, same as before.
 
-**4. It reaches a waypoint but ignores the rest.**
-Make sure each consecutive marker is a **short, directly walkable hop** from the previous one — a few blocks along an actual floor/staircase, not across a gap or through a wall. If two markers can't see each other on foot, the courier can't bridge them (it'll fall back to teleport).
+**4. It seems to detour oddly, or won't use a shortcut you built.**
+Digging or building near a route drops the courier's cached path immediately, but the golem still won't cross ground it hasn't mapped as walkable — a closed door reads as a wall, the top of a fence or wall isn't floor, and a diagonal move is never allowed to also step up (mobs can't jump diagonally onto a block). If a shortcut isn't being used, check it's actually walkable by those rules, not just by a player.
 
 **5. The sign text doesn't match.**
-The waypoint text must equal `waypoint-sign-text` exactly (default `[Waypoint]`), on any face of the sign. A tag on a container must equal the tag you set in the route (or the container's anvil name), exactly.
+A `[Waypoint]` sign's text must equal `waypoint-sign-text` exactly (default `[Waypoint]`), on any face of the sign. A tag on a container must equal the tag you set in the route (or the container's anvil name), exactly.
 
 **6. It never even starts.**
 Check the route filter. A **whitelist** with no items carries **nothing**; an over-broad **blacklist** can exclude everything the source holds. The status will say *"Source has nothing the filter allows."*
 
-**7. Nothing works and you want it to just go.**
-Set `courier-teleport: true` (the default) so it blinks to the target when stuck. If it *is* true and still won't move, the cause is almost always #1 or #2 — the golem has no valid job to do.
+**7. Nothing works and you just want it to go.**
+`courier-teleport` defaults to **`false`** on purpose — a stuck courier is telling you the route is broken, and the intended fix is to rebuild the route, not blink past it. If you're certain the geometry genuinely can't be walked (a server with terrain from before real pathfinding existed, say), set `courier-teleport: true` to bring back the old last-resort blink. If it's already `true` and the golem still won't move, the cause is almost always #1 or #2 — it has no valid job to do in the first place.
 
 ---
 
 ## Asking a golem what's wrong
 
-If a golem is standing there and you can't see why, stand within 12 blocks of it and run **`/golemdebug`** (needs `lavagolem.admin`). It latches onto the nearest golem and narrates its decisions in chat — which containers it found, what it decided to do, and where it gave up:
+If a golem is standing there and you can't see why, stand within 12 blocks of it and run
+**`/lavagolem debug`** (needs `lavagolem.admin`). It latches onto the nearest golem and narrates its
+decisions in chat — which containers it found, what it decided to do, and where it gave up:
 
 ```
 [G] decide mode=BALANCED furnaces=3 smelt=true fuel=false output=true
 [G] step2 STALL: furnace has no fuel and no [Fuel] chest found
 ```
 
-Run it again to switch tracing off. It's per-golem and doesn't survive a restart, so it's safe to leave on while you fix the station. Right now it traces the **Smelter's** decision loop — the one with the most moving parts.
+Run it again to switch tracing off. It's per-golem and doesn't survive a restart, so it's safe to
+leave on while you fix the station.
+
+You don't have to walk to each golem: **`/lavagolem debug all`** traces every golem, and
+**`/lavagolem debug courier`** (or any other role name) traces just that role, including golems
+placed later.
+
+Chat is a poor place to read a long trace, so `golemdebug-output` in the config can send it to
+`plugins/LavaGolem/golemdebug.log` instead (`chat`, `file` or `both`). File output keeps writing
+after you log out, which is the point — leave a courier tracing, come back, and read what it did.
+Each line is stamped with the time and a short golem id, so several golems at once still make sense.
+
+Alongside each role's own decisions it traces the whole pathfinding story: the route it asked for,
+whether it found a complete path or gave up, what it cached, and what Minecraft's own navigation did
+with each step it was handed.
 
 ---
 
@@ -288,6 +346,7 @@ search-radius: 8            # Blocks a golem scans for containers/cauldrons/furn
 reach-distance: 2.2         # Distance at which a golem "arrives" at its target
 search-cooldown-ticks: 40   # Ticks to wait before retrying a failed search (20 ticks = 1s)
 tick-period: 10             # How often golem logic runs, in game ticks
+golem-stuck-ticks: 30       # Logic ticks with no real progress before a golem gives up on its target and looks for other work (min 5, ~15s at the default tick-period)
 
 # Tags — each works as a sign OR as the container's own anvil name
 bucket-sign-text: "[Buckets]"   # Lava Golem: empty buckets
@@ -321,12 +380,42 @@ enable-fisher-golem: true
 # --- Courier only ---
 courier-search-radius: 24    # Same in every direction; must cover BOTH ends of a route. Capped at 32 (cost ~ radius^3)
 courier-carry-limit: 16      # Items carried per trip (1-64)
-waypoint-sign-text: "[Waypoint]"  # Marker text for pathfinding waypoints
-courier-teleport: true       # Last-resort blink to the target when it can't be walked to
-courier-stuck-ticks: 20      # Logic ticks of no progress before that blink
+waypoint-sign-text: "[Waypoint]"  # Optional marker text — ground near one is cheaper to route through, and it's the fallback if a search fails
+courier-teleport: false      # Legacy last-resort blink for geometry that genuinely can't be walked. Off by default: a stuck golem re-homes its load, marks itself "(stuck)" and retries on a backoff instead
+courier-stuck-ticks: 20      # Parsed but not currently read by the navigation stall/retry logic — see golem-stuck-ticks and nav-move-refused-ticks below for what actually governs a courier's stalls
+
+# --- Navigation (long-distance walking) ---
+# Every golem now plans its walk with its own A* pathfinder over a cached map of "where can I stand"
+# for each chunk it's visited, instead of relying only on vanilla's short-range pathfinding plus
+# [Waypoint] hopping. Vanilla still handles the last few steps (doors, stairs, small gaps) — this
+# just gets the golem to the right neighbourhood first, reliably, within a bounded search area.
+nav-async: true               # Compute routes on a background thread instead of the main thread
+nav-max-distance: 256         # How far (blocks) a single route search may reach before falling back to waypoint-hopping
+nav-max-nodes: 20000          # Map cells one search may examine before settling for its best partial route
+nav-chunk-cache-seconds: 600  # How long a chunk's walkability map is trusted before being rebuilt from scratch (on top of immediate event-based invalidation)
+nav-chunks-per-tick: 4        # Chunks' worth of walkability map the server may build per logic tick during the normal slow trickle
+nav-chunks-per-tick-burst: 24 # Ceiling used instead of the above for one tick when a golem is actively blocked waiting on chunks
+nav-max-concurrent: 4         # How many golems may have a route search running at once, server-wide
+nav-starved-retries: 40       # Absolute ceiling on consecutive waits for unmapped terrain before giving up regardless (runaway guard)
+nav-starved-stall-tries: 3    # Consecutive waits with no shrinking of the unmapped count before walking the best partial instead
+nav-prewarm-max-chunks: 256   # Cap on chunks a leg's first request may seed into the build queue
+nav-max-step-down: 1          # Blocks a route may step DOWN in a single move (1-3) — vanilla won't voluntarily walk further than this anyway
+nav-max-leg-blocks: 10        # Longest a single leg may be, in blocks (4-32), before being chopped back to known-walkable points
+nav-search-margin: 32         # How far past the straight line to the target a route may wander, in blocks (8-128) — the search bound
+nav-move-refused-ticks: 4     # Consecutive ticks vanilla may flatly refuse to walk toward the current turn point before that alone counts as a stall (2-40)
 
 locale: en                  # en or ru
 bstats: true                # Anonymous usage statistics (bstats.org)
+
+# --- Debug tracing ---
+golemdebug-output: chat     # chat | file | both — where /lavagolem debug traces go (file: plugins/LavaGolem/golemdebug.log, rotated past 5MB)
+
+# --- Ownership & golem cap ---
+max-golems-per-player: 0    # Max golems a single player may have placed at once (0 = unlimited); lavagolem.limit.bypass ignores it
+
+# --- Container protection ---
+protection-mode: cached         # cached | strict | off — what to do when a golem's owner can't be reached live (see "Ownership, permissions & protection" above)
+protection-cache-seconds: 300   # How long a container's last verdict is trusted as the offline fallback, in seconds
 ```
 
-**Reloading:** change the file, then restart the server (or reload the plugin) for changes to take effect.
+**Reloading:** `/lavagolem reload` re-reads `config.yml` without restarting the server. Config no longer needs to be deleted between updates, either: on startup, any key the shipped template has that your file is missing gets appended with its documentation (after a backup to `config.yml.bak`); a key your file has that the plugin no longer ships is reported in the log but never rewritten or removed.

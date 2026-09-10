@@ -46,7 +46,7 @@ Carries items between tagged containers along routes you set in its GUI.
 - **Routes** — as many as you like, each moving items from one tag to another. Left-click a slot to cycle nearby tags, right-click to type any tag yourself.
 - **Item filter** — shift-click items from your inventory into the filter; per route it works as a **blacklist** (default) or a **whitelist**.
 - **Status** — the menu says exactly why a route isn't running (no source, destination full, filter blocks everything, both ends are the same chest).
-- **Waypoints** — place signs saying `[Waypoint]` along a walkable path and the courier walks marker-to-marker (up stairs, around corners) instead of into a wall. Markers are shared by every courier; each picks the one closest to *its* own target. If a target really can't be reached on foot, it teleports as a last resort (`courier-teleport`).
+- **Finds its own way** — plans each route with its own pathfinder over a cached map of walkable ground, off the main thread, then lets vanilla walk the short legs in between (stairs, doors, corners). `[Waypoint]` signs are optional, not required: ground near one is cheaper to route through, so the golem prefers a road you've built, and they're still the fallback if a search comes up empty. A golem that genuinely can't reach its target says so instead of cheating past the problem — it re-homes whatever it was carrying, appends `(stuck)` to its name, shows the reason in the route status, and keeps retrying on a widening backoff (`courier-teleport`, off by default, brings back the old blink-to-target behaviour).
 
 ## Recipes
 
@@ -96,13 +96,43 @@ These are only the **defaults**. In any golem's menu, right-click a container sl
 - **Disassemble** — sneak + right-click with an empty hand; the Heart drops back along with anything the golem carried.
 - Golems, their current job, mode and routes survive server restarts.
 
+## Ownership & protection
+
+- **Placing a Heart makes you the owner.** The Heart itself is never tagged — it stays freely tradeable — only the act of placing it assigns ownership. A golem placed before 1.1.0 has no owner and keeps working for anyone, exactly as before.
+- **Only the owner can use it** — menu, tags, routes, disassembly — unless you (or they) have `lavagolem.use.others`.
+- **Migrating an old golem?** `/lavagolem claim` adopts the nearest unowned golem within 12 blocks *in place*, keeping its stats, tags and mode. Disassembling and re-placing instead starts a brand-new golem with counters back at zero — `claim` is almost always what you want.
+- **A cap, if you want one.** `max-golems-per-player` (default `0`, unlimited) limits how many golems one player may have placed at once; `lavagolem.limit.bypass` ignores it. A refused placement never consumes the Heart.
+
+| Permission | Default | Lets a player... |
+|---|---|---|
+| `lavagolem.craft` | true | Craft a Golem Heart |
+| `lavagolem.place` | true | Place a Heart to spawn a golem |
+| `lavagolem.use` | true | Use golems they own — menu, tags, routes, disassembly |
+| `lavagolem.use.others` | op | Use a golem someone else owns |
+| `lavagolem.limit.bypass` | op | Ignore `max-golems-per-player` |
+| `lavagolem.admin` | op | Every `/lavagolem` subcommand |
+
+**Container protection.** If GriefPrevention or WorldGuard is installed, an *owned* golem's container access is checked against it (claims + container trust for GriefPrevention, the `CHEST_ACCESS` flag for WorldGuard); a legacy, unowned golem is never checked, matching how it always worked. A generic fallback hook covers other protection plugins too, but only while the owner is online to fire it as. `protection-mode` governs what happens when the owner can't be reached live: `cached` (default) trusts the last recorded verdict, `strict` refuses anything unverified, `off` disables the checks entirely.
+
+The GriefPrevention and WorldGuard adapters have **not been tested on a live server** running either plugin — treat them as best-effort, not verified. No hook is ever trusted blindly: a misbehaving one is ignored rather than allowed to wedge a golem, and it switches itself off after repeated failures.
+
 ## Commands
 
-| Command | Permission | Description |
-|---------|-----------|-------------|
-| `/removegolems` | `lavagolem.admin` | Remove all custom golems |
-| `/golemstats`   | `lavagolem.admin` | Show aggregate statistics |
-| `/golemdebug`   | `lavagolem.admin` | Toggle live decision tracing for the nearest golem (within 12 blocks) — it reports in chat why it isn't working |
+Everything lives under `/lavagolem` (short form `/lg`), and all of it needs `lavagolem.admin`.
+
+| Command | Description |
+|---------|-------------|
+| `/lavagolem reload` | Re-read `config.yml` without restarting the server |
+| `/lavagolem stats` | Show aggregate statistics |
+| `/lavagolem debug [all\|<role>]` | Toggle live decision tracing — no argument follows the nearest golem within 12 blocks, `all` every golem, or name a role (`courier`, `smelter`, …). It reports why a golem isn't working, in chat or to a log file |
+| `/lavagolem claim` | Take ownership of the nearest unowned golem within 12 blocks |
+| `/lavagolem remove <all\|player>` | Remove every golem, or only one player's |
+
+`/lavagolem remove` deliberately refuses to run without an argument — it deletes golems belonging to
+everyone on the server, and that is not something to trigger from muscle memory.
+
+The old names — `/removegolems`, `/golemstats`, `/golemdebug`, `/golemclaim` — still work and still
+need the same permission, but they are deprecated and will print a pointer at their replacement.
 
 ## Configuration
 
@@ -136,10 +166,26 @@ enable-fisher-golem: true
 
 courier-search-radius: 24 # Courier only: same in every direction, must cover both ends of a route (max 32)
 courier-carry-limit: 16   # Items a courier carries per trip
-waypoint-sign-text: "[Waypoint]"
-courier-teleport: true    # Last-resort blink when a target can't be walked to
-courier-stuck-ticks: 20   # Logic ticks of no progress before blinking
+waypoint-sign-text: "[Waypoint]" # Optional: ground near a marker is cheaper to route through, and it's the fallback if a search fails
+courier-teleport: false   # Legacy last resort for geometry that genuinely can't be walked; leave off so a stuck golem retries instead of cheating past broken infrastructure
 
+# --- Navigation ---
+# Every golem plans its walk with its own pathfinder (off the main thread) over a cached map of
+# walkable ground; vanilla only handles each short leg (stairs, doors, small gaps). Golems only path
+# through loaded chunks, within nav-search-margin of the target — this isn't for long-distance
+# hauling across unloaded terrain. Many more nav-* tuning keys exist; see the full guide.
+nav-max-distance: 256     # How far (blocks) a single route search may reach before giving up
+nav-search-margin: 32     # How far past the straight line to the target a route may wander (blocks)
+nav-chunk-cache-seconds: 600 # How long a chunk's walkability map is trusted before being rebuilt
+
+# --- Ownership & golem cap ---
+max-golems-per-player: 0  # Max golems one player may have placed at once (0 = unlimited)
+
+# --- Container protection ---
+protection-mode: cached       # cached | strict | off — what to do when a golem's owner can't be reached live
+protection-cache-seconds: 300 # How long a container's last verdict is trusted as the offline fallback
+
+golemdebug-output: chat   # chat | file | both — where /lavagolem debug traces go
 locale: en                # en or ru
 bstats: true              # Anonymous usage stats
 ```
@@ -164,7 +210,7 @@ Requires Java 21 and Maven 3.x.
 mvn clean package
 ```
 
-The plugin jar will be at `target/lavagolem-1.0.4.jar`.
+The plugin jar will be at `target/lavagolem-1.1.0.jar`.
 
 ## License
 

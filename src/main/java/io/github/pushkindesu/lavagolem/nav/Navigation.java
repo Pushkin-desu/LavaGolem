@@ -77,7 +77,16 @@ public final class Navigation {
 
     private final LavaGolemPlugin plugin;
     private final NavMesh mesh;
-    private final ExecutorService pool;
+    // Not final: /lavagolem reload can resize this (see reload()) when nav-max-concurrent changes.
+    private ExecutorService pool;
+    // How many threads `pool` currently has, so reload() can tell whether nav-max-concurrent
+    // actually changed without asking the ExecutorService itself (ExecutorService has no getter).
+    private int poolThreads;
+    private static final ThreadFactory NAV_THREAD_FACTORY = r -> {
+        Thread t = new Thread(r, "LavaGolem-Nav");
+        t.setDaemon(true); // never hold the server open on shutdown waiting for a stray search
+        return t;
+    };
     private final AtomicInteger inFlight = new AtomicInteger();
 
     /** Traces one event into GolemTicker's /golemdebug chat feed. A no-op until GolemTicker wires
@@ -218,13 +227,35 @@ public final class Navigation {
     public Navigation(LavaGolemPlugin plugin, NavMesh mesh) {
         this.plugin = plugin;
         this.mesh = mesh;
-        int threads = Math.max(1, plugin.cfg.navMaxConcurrent);
-        ThreadFactory factory = r -> {
-            Thread t = new Thread(r, "LavaGolem-Nav");
-            t.setDaemon(true); // never hold the server open on shutdown waiting for a stray search
-            return t;
-        };
-        this.pool = Executors.newFixedThreadPool(threads, factory);
+        this.poolThreads = Math.max(1, plugin.cfg.navMaxConcurrent);
+        this.pool = Executors.newFixedThreadPool(poolThreads, NAV_THREAD_FACTORY);
+    }
+
+    /** Applies whatever changed in config since this was built: nav-max-concurrent (worker pool
+     *  size) and nav-chunk-cache-seconds (NavMesh TTL) — see LavaGolemPlugin's /lavagolem reload.
+     * Every per-golem/per-chunk transient collection is cleared rather than migrated, which the
+     * class doc already establishes is always safe here: a golem's real state lives in its PDC, so
+     * it simply recomputes its route next tick. A search that happened to be in flight against the
+     * OLD pool just lands on a NavState nothing reads any more (states.clear() below) and is
+     * silently discarded — never applied against stale config. */
+    public void reload() {
+        int wantThreads = Math.max(1, plugin.cfg.navMaxConcurrent);
+        if (wantThreads != poolThreads) {
+            ExecutorService old = pool;
+            poolThreads = wantThreads;
+            pool = Executors.newFixedThreadPool(poolThreads, NAV_THREAD_FACTORY);
+            // shutdown() (not shutdownNow()) -- anything already running is left to finish and
+            // report through the shared `inFlight`/`justBuilt` handoffs, it just never receives new
+            // work. Its result lands on now-cleared state and is discarded, per the note above.
+            old.shutdown();
+        }
+        mesh.reload(plugin.cfg.navChunkCacheSeconds);
+        states.clear();
+        wanted.clear();
+        waitingGolems.clear();
+        justBuilt.clear();
+        routeCache.clear();
+        routeCacheByChunk.clear();
     }
 
     /** Wires this class into GolemTicker's existing /golemdebug feed instead of duplicating it —
