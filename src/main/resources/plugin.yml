@@ -7,17 +7,21 @@ website: https://github.com/Pushkin-desu/LavaGolem
 description: Automated lava-fetching golems for survival servers.
 softdepend: [GriefPrevention, WorldGuard]
 commands:
+  lavagolem:
+    description: LavaGolem's command surface -- reload, stats, debug, claim, remove
+    aliases: [lg]
+    usage: /lavagolem <reload|stats|debug|claim|remove> [args]
   removegolems:
-    description: Remove all lava golems from the server
+    description: "Deprecated -- use /lavagolem remove all. Remove all lava golems from the server"
     permission: lavagolem.admin
   golemstats:
-    description: Show aggregate statistics for all lava golems
+    description: "Deprecated -- use /lavagolem stats. Show aggregate statistics for all lava golems"
     permission: lavagolem.admin
   golemdebug:
-    description: Toggle live decision tracing. No args = nearest golem; "all" = every golem; a role name (lava_hauler/smelter/courier/alchemist/fisher) = every golem of that role
+    description: 'Deprecated -- use /lavagolem debug. Toggle live decision tracing. No args = nearest golem; "all" = every golem; a role name (lava_hauler/smelter/courier/alchemist/fisher) = every golem of that role'
     permission: lavagolem.admin
   golemclaim:
-    description: Claim the nearest unowned golem within 12 blocks
+    description: Deprecated -- use /lavagolem claim. Claim the nearest unowned golem within 12 blocks
     permission: lavagolem.admin
 permissions:
   lavagolem.admin:

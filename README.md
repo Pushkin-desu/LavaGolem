@@ -98,11 +98,21 @@ These are only the **defaults**. In any golem's menu, right-click a container sl
 
 ## Commands
 
-| Command | Permission | Description |
-|---------|-----------|-------------|
-| `/removegolems` | `lavagolem.admin` | Remove all custom golems |
-| `/golemstats`   | `lavagolem.admin` | Show aggregate statistics |
-| `/golemdebug`   | `lavagolem.admin` | Toggle live decision tracing for the nearest golem (within 12 blocks) — it reports in chat why it isn't working |
+Everything lives under `/lavagolem` (short form `/lg`), and all of it needs `lavagolem.admin`.
+
+| Command | Description |
+|---------|-------------|
+| `/lavagolem reload` | Re-read `config.yml` without restarting the server |
+| `/lavagolem stats` | Show aggregate statistics |
+| `/lavagolem debug [all\|<role>]` | Toggle live decision tracing — no argument follows the nearest golem within 12 blocks, `all` every golem, or name a role (`courier`, `smelter`, …). It reports why a golem isn't working, in chat or to a log file |
+| `/lavagolem claim` | Take ownership of the nearest unowned golem within 12 blocks |
+| `/lavagolem remove <all\|player>` | Remove every golem, or only one player's |
+
+`/lavagolem remove` deliberately refuses to run without an argument — it deletes golems belonging to
+everyone on the server, and that is not something to trigger from muscle memory.
+
+The old names — `/removegolems`, `/golemstats`, `/golemdebug`, `/golemclaim` — still work and still
+need the same permission, but they are deprecated and will print a pointer at their replacement.
 
 ## Configuration
 

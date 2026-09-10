@@ -7,7 +7,10 @@ import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.World;
+import org.bukkit.command.Command;
+import org.bukkit.command.CommandSender;
 import org.bukkit.entity.Entity;
 import org.bukkit.entity.Mob;
 import org.bukkit.inventory.ItemStack;
@@ -21,6 +24,7 @@ import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
@@ -364,166 +368,7 @@ public final class LavaGolemPlugin extends JavaPlugin {
         getServer().getPluginManager().registerEvents(
                 new io.github.pushkindesu.lavagolem.nav.NavMeshListener(navMesh, navigation), this);
 
-        getCommand("removegolems").setExecutor((sender, command, label, args) -> {
-            int count = 0;
-            for (World world : Bukkit.getWorlds()) {
-                for (Entity entity : world.getEntitiesByClass(Mob.class)) {
-                    if (entity.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) {
-                        cleanedUpGolems.remove(entity.getUniqueId());
-                        entity.remove();
-                        count++;
-                    }
-                }
-            }
-            sender.sendMessage(msg.get("removed-count", Map.of("count", String.valueOf(count))));
-            return true;
-        });
-
-        getCommand("golemdebug").setExecutor((sender, command, label, args) -> {
-            if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("In-game only."); return true; }
-
-            // No argument: the original behaviour, unchanged — walk up to a golem and toggle it.
-            if (args.length == 0) {
-                Mob nearest = null;
-                double best = Double.MAX_VALUE;
-                for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
-                    if (!(e instanceof Mob m)) continue;
-                    if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
-                    double d = e.getLocation().distanceSquared(p.getLocation());
-                    if (d < best) { best = d; nearest = m; }
-                }
-                if (nearest == null) {
-                    p.sendMessage(Component.text("No golem within 12 blocks.", NamedTextColor.RED));
-                    return true;
-                }
-                if (debugWatchers.remove(nearest.getUniqueId()) != null) {
-                    p.sendMessage(Component.text("Debug OFF for the nearest golem.", NamedTextColor.YELLOW));
-                    logDebugToggleMarker(nearest, false, p);
-                } else {
-                    debugWatchers.put(nearest.getUniqueId(), p.getUniqueId());
-                    p.sendMessage(Component.text("Debug ON for the nearest golem — "
-                            + debugOutputHint() + ".", NamedTextColor.GREEN));
-                    logDebugToggleMarker(nearest, true, p);
-                }
-                return true;
-            }
-
-            // "all": every golem on the server, including ones that spawn later — a separate flag
-            // rather than one debugWatchers entry per golem, so it doesn't need re-arming as new
-            // golems appear and doesn't need enumerating the whole server just to switch it off.
-            if (args[0].equalsIgnoreCase("all")) {
-                if (debugAllWatcher != null) {
-                    debugAllWatcher = null;
-                    p.sendMessage(Component.text("Debug OFF for all golems.", NamedTextColor.YELLOW));
-                    logDebugBroadMarker("ALL golems", false, p, 0);
-                } else {
-                    debugAllWatcher = p.getUniqueId();
-                    int count = countGolems(null);
-                    p.sendMessage(Component.text("Debug ON for ALL golems (" + count
-                            + " currently) — " + debugOutputHint() + ".", NamedTextColor.GREEN));
-                    logDebugBroadMarker("ALL golems", true, p, count);
-                }
-                return true;
-            }
-
-            // A specific role, e.g. "courier" or "couriers" — same idea as "all" but scoped down.
-            String role = resolveDebugRole(args[0]);
-            if (role == null) {
-                p.sendMessage(Component.text("Unknown golem role '" + args[0]
-                        + "'. Use: all, lava_hauler, smelter, courier, alchemist, fisher.", NamedTextColor.RED));
-                return true;
-            }
-            if (debugRoleWatchers.remove(role) != null) {
-                p.sendMessage(Component.text("Debug OFF for role " + role + ".", NamedTextColor.YELLOW));
-                logDebugBroadMarker("role " + role, false, p, 0);
-            } else {
-                debugRoleWatchers.put(role, p.getUniqueId());
-                int count = countGolems(role);
-                p.sendMessage(Component.text("Debug ON for role " + role + " (" + count
-                        + " currently) — " + debugOutputHint() + ".", NamedTextColor.GREEN));
-                logDebugBroadMarker("role " + role, true, p, count);
-            }
-            return true;
-        });
-        getCommand("golemdebug").setTabCompleter((sender, command, alias, args) -> {
-            if (args.length != 1) return List.of();
-            String prefix = args[0].toLowerCase(Locale.ROOT);
-            List<String> options = List.of("all", "lava_hauler", "smelter", "courier", "alchemist", "fisher");
-            List<String> out = new ArrayList<>();
-            for (String o : options) if (o.startsWith(prefix)) out.add(o);
-            return out;
-        });
-
-        getCommand("golemstats").setExecutor((sender, command, label, args) -> {
-            int golems = 0;
-            int totalLava = 0;
-            int totalBuckets = 0;
-            int totalSmelted = 0;
-            int totalCaught = 0;
-            for (World world : Bukkit.getWorlds()) {
-                for (Entity entity : world.getEntitiesByClass(Mob.class)) {
-                    if (!entity.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
-                    golems++;
-                    totalLava += entity.getPersistentDataContainer()
-                            .getOrDefault(lavaDeliveredKey, PersistentDataType.INTEGER, 0);
-                    totalBuckets += entity.getPersistentDataContainer()
-                            .getOrDefault(bucketsTakenKey, PersistentDataType.INTEGER, 0);
-                    totalSmelted += entity.getPersistentDataContainer()
-                            .getOrDefault(itemsSmeltedKey, PersistentDataType.INTEGER, 0);
-                    totalCaught += entity.getPersistentDataContainer()
-                            .getOrDefault(fishCaughtKey, PersistentDataType.INTEGER, 0)
-                            + entity.getPersistentDataContainer()
-                            .getOrDefault(treasureCaughtKey, PersistentDataType.INTEGER, 0);
-                }
-            }
-            sender.sendMessage(Component.text()
-                    .append(Component.text(msg.get("total-stats-header"), NamedTextColor.GOLD))
-                    .append(Component.newline())
-                    .append(Component.text(msg.get("total-alive"), NamedTextColor.GRAY))
-                    .append(Component.text(golems, NamedTextColor.WHITE))
-                    .append(Component.newline())
-                    .append(Component.text(msg.get("total-delivered"), NamedTextColor.GRAY))
-                    .append(Component.text(totalLava, NamedTextColor.WHITE))
-                    .append(Component.newline())
-                    .append(Component.text(msg.get("total-buckets"), NamedTextColor.GRAY))
-                    .append(Component.text(totalBuckets, NamedTextColor.WHITE))
-                    .append(Component.newline())
-                    .append(Component.text(msg.get("total-smelted"), NamedTextColor.GRAY))
-                    .append(Component.text(totalSmelted, NamedTextColor.WHITE))
-                    .append(Component.newline())
-                    .append(Component.text(msg.get("total-caught"), NamedTextColor.GRAY))
-                    .append(Component.text(totalCaught, NamedTextColor.WHITE))
-                    .build());
-            return true;
-        });
-
-        getCommand("golemclaim").setExecutor((sender, command, label, args) -> {
-            if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("In-game only."); return true; }
-
-            // Nearest golem overall (owned or not) within 12 blocks -- same search shape as
-            // /golemdebug's no-argument form, so the two commands feel consistent to use.
-            Mob nearest = null;
-            double best = Double.MAX_VALUE;
-            for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
-                if (!(e instanceof Mob m)) continue;
-                if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
-                double d = e.getLocation().distanceSquared(p.getLocation());
-                if (d < best) { best = d; nearest = m; }
-            }
-            if (nearest == null) {
-                p.sendMessage(Component.text(msg.get("golemclaim-none"), NamedTextColor.RED));
-                return true;
-            }
-            if (ownerOf(nearest) != null) {
-                // Refuse politely rather than silently reassigning it -- an already-owned golem is
-                // someone's working station, not migration material.
-                p.sendMessage(Component.text(msg.get("golemclaim-already-owned"), NamedTextColor.RED));
-                return true;
-            }
-            nearest.getPersistentDataContainer().set(ownerKey, PersistentDataType.STRING, p.getUniqueId().toString());
-            p.sendMessage(Component.text(msg.get("golemclaim-success"), NamedTextColor.GREEN));
-            return true;
-        });
+        registerCommands();
 
         golemTicker = new GolemTicker(this);
         // Navigation traces through GolemTicker's existing /golemdebug machinery rather than
@@ -533,6 +378,433 @@ public final class LavaGolemPlugin extends JavaPlugin {
         golemTicker.runTaskTimer(this, 20L, cfg.tickPeriod);
 
         getLogger().info("LavaGolem enabled.");
+    }
+
+    // ================= Commands =================
+    //
+    // One root command (/lavagolem, alias /lg) with subcommands, plus the four original command
+    // names kept registered and working forever -- this plugin has public releases, and old command
+    // names show up in README/GUIDE copies people already have, in their own command blocks, and in
+    // their permission setups. Each legacy executor prints one short pointer at its replacement, then
+    // calls the exact same body method the new subcommand uses, so behaviour never drifts between
+    // the two spellings.
+
+    /** Wires up /lavagolem plus the four legacy command names. Split out of onEnable purely to keep
+     *  that method from growing any longer -- nothing here changes what any command actually does. */
+    private void registerCommands() {
+        getCommand("lavagolem").setExecutor(this::onLavaGolemCommand);
+        getCommand("lavagolem").setTabCompleter(this::onLavaGolemTabComplete);
+
+        getCommand("removegolems").setExecutor((sender, command, label, args) -> {
+            sender.sendMessage(Component.text(msg.get("legacy-notice-removegolems"), NamedTextColor.YELLOW));
+            removeAllGolems(sender);
+            return true;
+        });
+
+        getCommand("golemstats").setExecutor((sender, command, label, args) -> {
+            sender.sendMessage(Component.text(msg.get("legacy-notice-golemstats"), NamedTextColor.YELLOW));
+            cmdStats(sender);
+            return true;
+        });
+
+        getCommand("golemdebug").setExecutor((sender, command, label, args) -> {
+            sender.sendMessage(Component.text(msg.get("legacy-notice-golemdebug"), NamedTextColor.YELLOW));
+            cmdDebug(sender, args);
+            return true;
+        });
+        getCommand("golemdebug").setTabCompleter((sender, command, alias, args) -> debugTabComplete(args));
+
+        getCommand("golemclaim").setExecutor((sender, command, label, args) -> {
+            sender.sendMessage(Component.text(msg.get("legacy-notice-golemclaim"), NamedTextColor.YELLOW));
+            cmdClaim(sender);
+            return true;
+        });
+    }
+
+    /** /lavagolem's executor: no argument prints help, otherwise dispatches to the matching
+     *  subcommand body -- the exact same methods the legacy commands call, just with the label/notice
+     *  stripped off since /lavagolem itself needs no deprecation pointer. */
+    private boolean onLavaGolemCommand(CommandSender sender, Command command, String label, String[] args) {
+        if (args.length == 0) {
+            sendHelp(sender);
+            return true;
+        }
+        String sub = args[0].toLowerCase(Locale.ROOT);
+        String[] rest = Arrays.copyOfRange(args, 1, args.length);
+        switch (sub) {
+            case "reload" -> { if (requireAdmin(sender)) cmdReload(sender); }
+            case "stats" -> { if (requireAdmin(sender)) cmdStats(sender); }
+            case "debug" -> { if (requireAdmin(sender)) cmdDebug(sender, rest); }
+            case "claim" -> { if (requireAdmin(sender)) cmdClaim(sender); }
+            case "remove" -> { if (requireAdmin(sender)) cmdRemove(sender, rest); }
+            // An unrecognised first word is treated the same as no argument at all -- printing the
+            // help list is friendlier than a bare "unknown command" for a typo like /lavagolem stat.
+            default -> sendHelp(sender);
+        }
+        return true;
+    }
+
+    private List<String> onLavaGolemTabComplete(CommandSender sender, Command command, String alias, String[] args) {
+        if (args.length == 1) {
+            List<String> out = new ArrayList<>();
+            if (sender.hasPermission("lavagolem.admin")) {
+                String prefix = args[0].toLowerCase(Locale.ROOT);
+                for (String s : List.of("reload", "stats", "debug", "claim", "remove")) {
+                    if (s.startsWith(prefix)) out.add(s);
+                }
+            }
+            return out;
+        }
+        if (args.length == 2 && !sender.hasPermission("lavagolem.admin")) return List.of();
+        if (args.length == 2 && "debug".equalsIgnoreCase(args[0])) return debugTabComplete(new String[]{args[1]});
+        if (args.length == 2 && "remove".equalsIgnoreCase(args[0])) return removeTabComplete(args[1]);
+        return List.of();
+    }
+
+    /** Shared by /lavagolem debug's second argument and legacy /golemdebug's only argument. */
+    private List<String> debugTabComplete(String[] args) {
+        if (args.length != 1) return List.of();
+        String prefix = args[0].toLowerCase(Locale.ROOT);
+        List<String> options = List.of("all", "lava_hauler", "smelter", "courier", "alchemist", "fisher");
+        List<String> out = new ArrayList<>();
+        for (String o : options) if (o.startsWith(prefix)) out.add(o);
+        return out;
+    }
+
+    /** "all" plus every online player's name -- an offline player can still be targeted by typing
+     *  their full name, this just doesn't suggest names nobody currently online could confirm. */
+    private List<String> removeTabComplete(String arg) {
+        String prefix = arg.toLowerCase(Locale.ROOT);
+        List<String> out = new ArrayList<>();
+        if ("all".startsWith(prefix)) out.add("all");
+        for (org.bukkit.entity.Player online : Bukkit.getOnlinePlayers()) {
+            if (online.getName().toLowerCase(Locale.ROOT).startsWith(prefix)) out.add(online.getName());
+        }
+        return out;
+    }
+
+    /** Prints the subcommands the sender may actually use. Every admin subcommand shares the one
+     *  lavagolem.admin node (see the plugin.yml doc comment on why no per-subcommand node exists), so
+     *  today this is simply "all five, or none" -- but written as a permission check rather than a
+     *  hardcoded list so it keeps making sense if that ever changes. */
+    private void sendHelp(CommandSender sender) {
+        if (!sender.hasPermission("lavagolem.admin")) {
+            sender.sendMessage(Component.text(msg.get("help-none"), NamedTextColor.RED));
+            return;
+        }
+        sender.sendMessage(Component.text(msg.get("help-header"), NamedTextColor.GOLD));
+        for (String key : List.of("help-reload", "help-stats", "help-debug", "help-claim", "help-remove")) {
+            sender.sendMessage(Component.text(msg.get(key), NamedTextColor.GRAY));
+        }
+    }
+
+    /** /lavagolem has no `permission:` in plugin.yml (unlike the legacy commands, which keep theirs
+     *  unchanged) specifically so a sender with no admin node can still run the bare command and see
+     *  {@link #sendHelp}'s "you can't use any of these" message instead of Bukkit's generic "Unknown
+     *  command" -- every subcommand body still has to gate itself, which is what this does. */
+    private boolean requireAdmin(CommandSender sender) {
+        if (sender.hasPermission("lavagolem.admin")) return true;
+        sender.sendMessage(Component.text(msg.get("no-permission-command"), NamedTextColor.RED));
+        return false;
+    }
+
+    /** Body of /lavagolem debug and legacy /golemdebug -- moved out of onEnable verbatim, argument
+     *  handling unchanged: no argument targets the nearest golem, "all" targets every golem, anything
+     *  else is resolved as a role name. */
+    /**
+     * Re-reads the config and pushes the new values into everything that captured one at startup.
+     *
+     * Deliberately split in two. Parsing comes first and is fully reversible: if the file is
+     * malformed or a value is rejected, cfg and msg go back to what they were and NOTHING
+     * downstream has been touched yet, so a typo can never take a running server's automation down.
+     * Only once a valid config exists do the subsystems get told about it.
+     */
+    private void cmdReload(CommandSender sender) {
+        PluginConfig oldCfg = cfg;
+        Messages oldMsg = msg;
+
+        try {
+            // Runs here too, not just at boot, so keys added by an update land in an existing file
+            // the moment someone reloads rather than only after the next restart.
+            ConfigMigrator.migrate(this);
+            reloadConfig();
+            cfg = new PluginConfig(this);
+            msg = new Messages(this);
+        } catch (Throwable t) {
+            cfg = oldCfg;
+            msg = oldMsg;
+            getLogger().warning("[LG] Config reload failed, staying on the previous config: " + t);
+            sender.sendMessage(Component.text(
+                    msg.get("reload-failed", Map.of("error", String.valueOf(t.getMessage()))),
+                    NamedTextColor.RED));
+            return;
+        }
+
+        java.util.List<Component> report = new java.util.ArrayList<>();
+        try {
+            // The period is baked into the scheduled task, so changing it needs a genuinely new one:
+            // a cancelled BukkitRunnable cannot be rescheduled. The replacement ticker starts with
+            // empty transient maps (stall tracking, last-problem reasons), which is harmless — all of
+            // it is rebuilt within a tick or two, and every golem's real state lives in its PDC. The
+            // tracer must be re-pointed at the new instance or /golemdebug would keep feeding the old.
+            if (cfg.tickPeriod != oldCfg.tickPeriod) {
+                golemTicker.cancel();
+                golemTicker = new GolemTicker(this);
+                navigation.setTracer(golemTicker::traceFromNav);
+                golemTicker.runTaskTimer(this, 1L, cfg.tickPeriod);
+                report.add(Component.text(msg.get("reload-ticker-changed", Map.of(
+                        "old", String.valueOf(oldCfg.tickPeriod),
+                        "new", String.valueOf(cfg.tickPeriod))), NamedTextColor.GRAY));
+            } else {
+                report.add(Component.text(msg.get("reload-ticker-unchanged",
+                        Map.of("period", String.valueOf(cfg.tickPeriod))), NamedTextColor.GRAY));
+            }
+
+            navigation.reload();
+            report.add(Component.text(msg.get("reload-nav"), NamedTextColor.GRAY));
+
+            java.util.List<String> recipeChanges = new java.util.ArrayList<>();
+            syncRecipe("golem_heart_recipe", oldCfg.enableLava, cfg.enableLava,
+                    this::registerHeartRecipe, "lava", recipeChanges);
+            syncRecipe("smelter_heart_recipe", oldCfg.enableSmelter, cfg.enableSmelter,
+                    this::registerSmelterHeartRecipe, "smelter", recipeChanges);
+            syncRecipe("courier_heart_recipe", oldCfg.enableCourier, cfg.enableCourier,
+                    this::registerCourierHeartRecipe, "courier", recipeChanges);
+            syncRecipe("alchemist_heart_recipe", oldCfg.enableAlchemist, cfg.enableAlchemist,
+                    this::registerAlchemistHeartRecipe, "alchemist", recipeChanges);
+            syncRecipe("fisher_heart_recipe", oldCfg.enableFisher, cfg.enableFisher,
+                    this::registerFisherHeartRecipe, "fisher", recipeChanges);
+            report.add(Component.text(recipeChanges.isEmpty()
+                    ? msg.get("reload-recipes-unchanged")
+                    : msg.get("reload-recipes-changed",
+                            Map.of("changes", String.join(", ", recipeChanges))), NamedTextColor.GRAY));
+
+            debugLog.reload();
+            report.add(Component.text(msg.get("reload-debug-log",
+                    Map.of("mode", cfg.golemdebugOutput.name().toLowerCase(java.util.Locale.ROOT))),
+                    NamedTextColor.GRAY));
+
+            protection.reload();
+            report.add(Component.text(msg.get("reload-protection"), NamedTextColor.GRAY));
+        } catch (Throwable t) {
+            // The new config is already valid and partly live, so putting the old one back here would
+            // leave things LESS consistent, not more. Say what went wrong and what did get applied.
+            getLogger().warning("[LG] Config reloaded but a subsystem failed to apply it: " + t);
+            sender.sendMessage(Component.text(
+                    msg.get("reload-failed", Map.of("error", String.valueOf(t.getMessage()))),
+                    NamedTextColor.RED));
+        }
+
+        Component out = Component.text(msg.get("reload-header"), NamedTextColor.GOLD);
+        for (Component line : report) out = out.append(Component.newline()).append(line);
+        sender.sendMessage(out);
+    }
+
+    /** Adds or removes one heart recipe when its enable-flag flipped across a reload. Getting this
+     *  wrong has bitten the project before: a recipe left registered makes the next addRecipe fail as
+     *  a duplicate key, and the heart then silently stops crafting with nothing in the log. */
+    private void syncRecipe(String key, boolean was, boolean now,
+                            Runnable register, String label, java.util.List<String> changes) {
+        if (was == now) return;
+        if (now) {
+            register.run();
+            changes.add("+" + label);
+        } else {
+            Bukkit.removeRecipe(new NamespacedKey(this, key));
+            changes.add("-" + label);
+        }
+    }
+
+    private void cmdDebug(CommandSender sender, String[] args) {
+        if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("In-game only."); return; }
+
+        // No argument: the original behaviour, unchanged — walk up to a golem and toggle it.
+        if (args.length == 0) {
+            Mob nearest = null;
+            double best = Double.MAX_VALUE;
+            for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
+                if (!(e instanceof Mob m)) continue;
+                if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                double d = e.getLocation().distanceSquared(p.getLocation());
+                if (d < best) { best = d; nearest = m; }
+            }
+            if (nearest == null) {
+                p.sendMessage(Component.text("No golem within 12 blocks.", NamedTextColor.RED));
+                return;
+            }
+            if (debugWatchers.remove(nearest.getUniqueId()) != null) {
+                p.sendMessage(Component.text("Debug OFF for the nearest golem.", NamedTextColor.YELLOW));
+                logDebugToggleMarker(nearest, false, p);
+            } else {
+                debugWatchers.put(nearest.getUniqueId(), p.getUniqueId());
+                p.sendMessage(Component.text("Debug ON for the nearest golem — "
+                        + debugOutputHint() + ".", NamedTextColor.GREEN));
+                logDebugToggleMarker(nearest, true, p);
+            }
+            return;
+        }
+
+        // "all": every golem on the server, including ones that spawn later — a separate flag
+        // rather than one debugWatchers entry per golem, so it doesn't need re-arming as new
+        // golems appear and doesn't need enumerating the whole server just to switch it off.
+        if (args[0].equalsIgnoreCase("all")) {
+            if (debugAllWatcher != null) {
+                debugAllWatcher = null;
+                p.sendMessage(Component.text("Debug OFF for all golems.", NamedTextColor.YELLOW));
+                logDebugBroadMarker("ALL golems", false, p, 0);
+            } else {
+                debugAllWatcher = p.getUniqueId();
+                int count = countGolems(null);
+                p.sendMessage(Component.text("Debug ON for ALL golems (" + count
+                        + " currently) — " + debugOutputHint() + ".", NamedTextColor.GREEN));
+                logDebugBroadMarker("ALL golems", true, p, count);
+            }
+            return;
+        }
+
+        // A specific role, e.g. "courier" or "couriers" — same idea as "all" but scoped down.
+        String role = resolveDebugRole(args[0]);
+        if (role == null) {
+            p.sendMessage(Component.text("Unknown golem role '" + args[0]
+                    + "'. Use: all, lava_hauler, smelter, courier, alchemist, fisher.", NamedTextColor.RED));
+            return;
+        }
+        if (debugRoleWatchers.remove(role) != null) {
+            p.sendMessage(Component.text("Debug OFF for role " + role + ".", NamedTextColor.YELLOW));
+            logDebugBroadMarker("role " + role, false, p, 0);
+        } else {
+            debugRoleWatchers.put(role, p.getUniqueId());
+            int count = countGolems(role);
+            p.sendMessage(Component.text("Debug ON for role " + role + " (" + count
+                    + " currently) — " + debugOutputHint() + ".", NamedTextColor.GREEN));
+            logDebugBroadMarker("role " + role, true, p, count);
+        }
+    }
+
+    /** Body of /lavagolem stats and legacy /golemstats -- moved out of onEnable verbatim. */
+    private void cmdStats(CommandSender sender) {
+        int golems = 0;
+        int totalLava = 0;
+        int totalBuckets = 0;
+        int totalSmelted = 0;
+        int totalCaught = 0;
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity entity : world.getEntitiesByClass(Mob.class)) {
+                if (!entity.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                golems++;
+                totalLava += entity.getPersistentDataContainer()
+                        .getOrDefault(lavaDeliveredKey, PersistentDataType.INTEGER, 0);
+                totalBuckets += entity.getPersistentDataContainer()
+                        .getOrDefault(bucketsTakenKey, PersistentDataType.INTEGER, 0);
+                totalSmelted += entity.getPersistentDataContainer()
+                        .getOrDefault(itemsSmeltedKey, PersistentDataType.INTEGER, 0);
+                totalCaught += entity.getPersistentDataContainer()
+                        .getOrDefault(fishCaughtKey, PersistentDataType.INTEGER, 0)
+                        + entity.getPersistentDataContainer()
+                        .getOrDefault(treasureCaughtKey, PersistentDataType.INTEGER, 0);
+            }
+        }
+        sender.sendMessage(Component.text()
+                .append(Component.text(msg.get("total-stats-header"), NamedTextColor.GOLD))
+                .append(Component.newline())
+                .append(Component.text(msg.get("total-alive"), NamedTextColor.GRAY))
+                .append(Component.text(golems, NamedTextColor.WHITE))
+                .append(Component.newline())
+                .append(Component.text(msg.get("total-delivered"), NamedTextColor.GRAY))
+                .append(Component.text(totalLava, NamedTextColor.WHITE))
+                .append(Component.newline())
+                .append(Component.text(msg.get("total-buckets"), NamedTextColor.GRAY))
+                .append(Component.text(totalBuckets, NamedTextColor.WHITE))
+                .append(Component.newline())
+                .append(Component.text(msg.get("total-smelted"), NamedTextColor.GRAY))
+                .append(Component.text(totalSmelted, NamedTextColor.WHITE))
+                .append(Component.newline())
+                .append(Component.text(msg.get("total-caught"), NamedTextColor.GRAY))
+                .append(Component.text(totalCaught, NamedTextColor.WHITE))
+                .build());
+    }
+
+    /** Body of /lavagolem claim and legacy /golemclaim -- moved out of onEnable verbatim. */
+    private void cmdClaim(CommandSender sender) {
+        if (!(sender instanceof org.bukkit.entity.Player p)) { sender.sendMessage("In-game only."); return; }
+
+        // Nearest golem overall (owned or not) within 12 blocks -- same search shape as
+        // /golemdebug's no-argument form, so the two commands feel consistent to use.
+        Mob nearest = null;
+        double best = Double.MAX_VALUE;
+        for (Entity e : p.getWorld().getNearbyEntities(p.getLocation(), 12, 12, 12)) {
+            if (!(e instanceof Mob m)) continue;
+            if (!m.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+            double d = e.getLocation().distanceSquared(p.getLocation());
+            if (d < best) { best = d; nearest = m; }
+        }
+        if (nearest == null) {
+            p.sendMessage(Component.text(msg.get("golemclaim-none"), NamedTextColor.RED));
+            return;
+        }
+        if (ownerOf(nearest) != null) {
+            // Refuse politely rather than silently reassigning it -- an already-owned golem is
+            // someone's working station, not migration material.
+            p.sendMessage(Component.text(msg.get("golemclaim-already-owned"), NamedTextColor.RED));
+            return;
+        }
+        nearest.getPersistentDataContainer().set(ownerKey, PersistentDataType.STRING, p.getUniqueId().toString());
+        p.sendMessage(Component.text(msg.get("golemclaim-success"), NamedTextColor.GREEN));
+    }
+
+    /** Body of legacy /removegolems (no arguments, always "everything") and the "all" form of
+     *  /lavagolem remove -- moved out of onEnable verbatim. */
+    private void removeAllGolems(CommandSender sender) {
+        int count = 0;
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity entity : world.getEntitiesByClass(Mob.class)) {
+                if (entity.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) {
+                    cleanedUpGolems.remove(entity.getUniqueId());
+                    entity.remove();
+                    count++;
+                }
+            }
+        }
+        sender.sendMessage(msg.get("removed-count", Map.of("count", String.valueOf(count))));
+    }
+
+    /** Removes only the golems owned by one specific player, by name. This is the one behaviour
+     *  change this part introduces: now that golems have owners, a bare "remove everything" is no
+     *  longer something /lavagolem remove should do by muscle memory -- see cmdRemove. Resolves the
+     *  name the same way any admin command that takes a player name would, working for an offline
+     *  player too as long as the server has seen them before (their UUID is then already cached). */
+    @SuppressWarnings("deprecation") // name -> UUID is the only lookup possible from a typed name
+    private void removeGolemsOwnedBy(CommandSender sender, String playerName) {
+        UUID targetId = Bukkit.getOfflinePlayer(playerName).getUniqueId();
+        int count = 0;
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity entity : world.getEntitiesByClass(Mob.class)) {
+                if (!entity.getPersistentDataContainer().has(golemEntityKey, PersistentDataType.BYTE)) continue;
+                if (!targetId.equals(ownerOf((Mob) entity))) continue;
+                cleanedUpGolems.remove(entity.getUniqueId());
+                entity.remove();
+                count++;
+            }
+        }
+        sender.sendMessage(msg.get("removed-count-player",
+                Map.of("count", String.valueOf(count), "player", playerName)));
+    }
+
+    /** Body of /lavagolem remove. Unlike legacy /removegolems, an argument is REQUIRED: "all" keeps
+     *  today's wipe-everything behaviour, anything else is taken as a player name and scopes the
+     *  removal to just their golems. Requiring the argument is deliberate -- see the class doc on
+     *  this part -- so nobody wipes a whole server's golems by typing the old muscle-memory command
+     *  under its new name. */
+    private void cmdRemove(CommandSender sender, String[] args) {
+        if (args.length != 1) {
+            sender.sendMessage(Component.text(msg.get("remove-usage"), NamedTextColor.RED));
+            return;
+        }
+        if (args[0].equalsIgnoreCase("all")) {
+            removeAllGolems(sender);
+        } else {
+            removeGolemsOwnedBy(sender, args[0]);
+        }
     }
 
     @Override

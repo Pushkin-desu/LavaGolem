@@ -268,14 +268,30 @@ Set `courier-teleport: true` (the default) so it blinks to the target when stuck
 
 ## Asking a golem what's wrong
 
-If a golem is standing there and you can't see why, stand within 12 blocks of it and run **`/golemdebug`** (needs `lavagolem.admin`). It latches onto the nearest golem and narrates its decisions in chat — which containers it found, what it decided to do, and where it gave up:
+If a golem is standing there and you can't see why, stand within 12 blocks of it and run
+**`/lavagolem debug`** (needs `lavagolem.admin`). It latches onto the nearest golem and narrates its
+decisions in chat — which containers it found, what it decided to do, and where it gave up:
 
 ```
 [G] decide mode=BALANCED furnaces=3 smelt=true fuel=false output=true
 [G] step2 STALL: furnace has no fuel and no [Fuel] chest found
 ```
 
-Run it again to switch tracing off. It's per-golem and doesn't survive a restart, so it's safe to leave on while you fix the station. Right now it traces the **Smelter's** decision loop — the one with the most moving parts.
+Run it again to switch tracing off. It's per-golem and doesn't survive a restart, so it's safe to
+leave on while you fix the station.
+
+You don't have to walk to each golem: **`/lavagolem debug all`** traces every golem, and
+**`/lavagolem debug courier`** (or any other role name) traces just that role, including golems
+placed later.
+
+Chat is a poor place to read a long trace, so `golemdebug-output` in the config can send it to
+`plugins/LavaGolem/golemdebug.log` instead (`chat`, `file` or `both`). File output keeps writing
+after you log out, which is the point — leave a courier tracing, come back, and read what it did.
+Each line is stamped with the time and a short golem id, so several golems at once still make sense.
+
+Alongside each role's own decisions it traces the whole pathfinding story: the route it asked for,
+whether it found a complete path or gave up, what it cached, and what Minecraft's own navigation did
+with each step it was handed.
 
 ---
 

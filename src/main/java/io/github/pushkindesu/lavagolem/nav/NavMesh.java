@@ -102,10 +102,22 @@ public final class NavMesh {
     private static final long UNLOADED_TTL_MS = 60_000L;
 
     private final ConcurrentHashMap<ChunkKey, Entry> cache = new ConcurrentHashMap<>();
-    private final long ttlMs;
+    // Not final: /lavagolem reload can change nav-chunk-cache-seconds without recreating this
+    // object (see reload() below) -- volatile because columnAt() is read from worker threads.
+    private volatile long ttlMs;
 
     public NavMesh(long ttlSeconds) {
         this.ttlMs = Math.max(0, ttlSeconds) * 1000L;
+    }
+
+    /** Applies a new TTL and drops every cached mesh so the change is felt immediately rather than
+     *  waiting for each entry to expire on its own -- called from Navigation#reload(). Keeping this
+     *  the SAME object (rather than swapping in a new NavMesh) matters: NavMeshListener and
+     *  LavaGolemPlugin both hold their own reference to this instance from construction, and there is
+     *  no clean way to hand them a replacement without threading a setter through both. */
+    public void reload(long ttlSeconds) {
+        this.ttlMs = Math.max(0, ttlSeconds) * 1000L;
+        cache.clear();
     }
 
     private static long ttlFor(Entry e, long realTtlMs) {

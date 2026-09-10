@@ -119,6 +119,13 @@ public final class GolemDebugLog {
         // and then queue up waiting for this method's lock while drainAndClose() is mid-flight on the
         // main thread; without this second check it would reopen the writer drainAndClose just closed.
         if (closed) return;
+        // Read fresh every pass rather than cached at construction, so a /lavagolem reload that
+        // changes golemdebug-output takes effect on the very next second-long tick of this task —
+        // not just for lines enqueued afterwards (every caller already gates enqueue() on the same
+        // config), but for the writer itself: without this check a mode switched OFF file output
+        // would still get its handle silently reopened here a moment after reload() (below) closed
+        // it, since ensureWriterOpen() only no-ops when the writer is ALREADY open.
+        if (!fileOutputWanted()) return;
         try {
             ensureWriterOpen();
             writeQueued();
@@ -127,12 +134,37 @@ public final class GolemDebugLog {
         }
     }
 
+    /** Whether the current config wants trace lines going to the file at all -- BOTH and FILE do,
+     *  CHAT alone does not. */
+    private boolean fileOutputWanted() {
+        return plugin.cfg.golemdebugOutput != PluginConfig.DebugOutput.CHAT;
+    }
+
+    /** Called from /lavagolem reload once the new config is already in place. A mode that still
+     *  wants file output needs nothing here — {@link #drain} already reads the live config fresh
+     *  every pass, so BOTH<->FILE swaps or a first switch-on just start writing on the next second-
+     *  long tick, same as a normal server start. A mode that just switched file output OFF gets an
+     *  explicit flush-then-close right now instead, the same sequence {@link #shutdown} uses, so
+     *  whatever was queued at the moment of the switch isn't silently dropped by the guard above. */
+    public synchronized void reload() {
+        if (fileOutputWanted()) return;
+        flushThenCloseWriter();
+    }
+
     /** Shutdown path: drain and close the writer under the SAME lock acquisition, so a periodic
      *  {@link #drain} that already slipped past the {@code closed} check can never land in between —
      *  it either completes first (writer still gets closed right after) or waits for this whole
      *  method to finish (by which point the writer is already gone and it opens nothing new, since
      *  {@link #ensureWriterOpen} only runs from inside drain/drainAndClose, both gated the same way). */
     private synchronized void drainAndClose() {
+        flushThenCloseWriter();
+    }
+
+    /** Flushes whatever's queued through an (opened-if-needed) writer, then closes it. Shared by
+     *  {@link #drainAndClose} (shutdown) and {@link #reload} (a live switch away from file output) —
+     *  both want the exact same "don't lose the tail, don't leave a handle open" guarantee, just on
+     *  different triggers. Caller must hold this object's lock. */
+    private void flushThenCloseWriter() {
         try {
             // Skip creating the file at all if it was never opened this session AND nothing is
             // queued -- a server that never once ran /golemdebug with file output shouldn't gain an

@@ -60,6 +60,20 @@ public final class ProtectionManager {
         registerHooks();
     }
 
+    /** Re-registers every hook from scratch and drops all per-session bookkeeping (the verdict
+     *  cache, failure counts, and any hook that had been switched off after repeated failures) —
+     *  called from LavaGolemPlugin's /lavagolem reload so protection-mode and protection-cache-
+     *  seconds take effect immediately, and a hook that got disabled earlier this session gets a
+     *  fresh set of strikes rather than staying off until a full server restart. */
+    public void reload() {
+        hooks.clear();
+        genericHook = null;
+        hookFailures.clear();
+        disabledHooks.clear();
+        cache.clear();
+        registerHooks();
+    }
+
     /** Registers each hook only when its plugin is actually enabled, and only if constructing it
      *  (which touches the real API) doesn't throw — a missing class or a method WorldGuard/
      *  GriefPrevention has since renamed then just disables that one hook with a warning, rather than
