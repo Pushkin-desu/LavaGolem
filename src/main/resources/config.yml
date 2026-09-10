@@ -105,9 +105,6 @@ waypoint-sign-text: "[Waypoint]"
 # running since before real pathfinding existed may have geometry that genuinely can't be walked at
 # all; if that's you, true re-enables the old blink-past-it behaviour.
 courier-teleport: false
-# Logic ticks of no path progress before the courier teleports toward its target
-# (a logic tick is `tick-period` game ticks; at the default that's ~0.5s, so 20 = ~10s).
-courier-stuck-ticks: 20
 
 # --- Navigation (long-distance walking) ---
 # Every golem now plans its walk with its own pathfinder over a cached map of "where can I stand"
@@ -199,8 +196,8 @@ locale: en
 bstats: true
 
 # --- Debug tracing ---
-# /golemdebug narrates a golem's decisions (and, for a courier, its pathfinding) live. This setting
-# controls where those lines go:
+# /lavagolem debug narrates a golem's decisions (and, for a courier, its pathfinding) live. This
+# setting controls where those lines go:
 #   chat - only into the toggling player's chat, same as before. Fine for standing next to a golem
 #          and watching it decide, but useless once you walk away or log off.
 #   file - only into plugins/LavaGolem/golemdebug.log (created on demand, rotated past 5MB). Nothing
@@ -210,6 +207,7 @@ bstats: true
 # The file is written off the main thread, so tracing several golems at once never costs server tick
 # time the way writing it inline would. Anything other than chat/file/both is warned about and treated
 # as chat.
+golemdebug-output: chat
 
 
 # --- Ownership & golem cap ---

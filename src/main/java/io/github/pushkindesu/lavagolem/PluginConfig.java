@@ -48,7 +48,6 @@ public class PluginConfig {
     public final int courierCarryLimit;
     public final String waypointSignText;
     public final boolean courierTeleport;
-    public final long courierStuckTicks;
     public final String locale;
     public final boolean bstats;
     public final DebugOutput golemdebugOutput;
@@ -118,7 +117,6 @@ public class PluginConfig {
         this.courierCarryLimit   = Math.max(1, Math.min(64, c.getInt("courier-carry-limit", 16)));
         this.waypointSignText    = c.getString("waypoint-sign-text", "[Waypoint]");
         this.courierTeleport     = c.getBoolean("courier-teleport", false);
-        this.courierStuckTicks   = c.getLong("courier-stuck-ticks", 20);
         this.locale              = c.getString("locale", "en");
         this.bstats              = c.getBoolean("bstats", true);
         // Same warn-and-fall-back pattern as the other validated strings above: a typo here would
